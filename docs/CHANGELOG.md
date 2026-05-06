@@ -1,10 +1,17 @@
 # Changelog
 
-## v0.0.16 — Unreleased (dev)
+## v0.0.16 — 2026-05-06
 
 ### Fixed
 
 - **Warmup never sticks for some accounts ("already active or in flight" loop)** — The ChatGPT `responses` endpoint can return 200 OK on a warmup ping without actually consuming quota; `set_warmed()` was then called regardless, flagging the account as warmed in the disk cache for 1h and short-circuiting all subsequent warmup attempts. Now real usage data is authoritative: if loaded or disk-cached usage shows `used == 0`, the account is treated as not warmed regardless of the `warmed_at` flag. Affects both TUI Enter > w and CLI `codex-switch warmup`
+- **ChatGPT usage API structural changes — free account 7d data restored** — The `wham/usage` API changed: free accounts now return a single 7d window in the `primary_window` slot (`limit_window_seconds: 604800`) with `secondary_window: null`, instead of the previous 5h+7d dual-window structure. The parser now reads `limit_window_seconds` to detect this layout and remaps the window to the `secondary` (7d) slot so scoring, eligibility, and display continue to work correctly. Plus/Pro accounts retain the original dual-window structure and are unaffected
+- **plan_type now sourced from usage API** — Previously read exclusively from the JWT `chatgpt_plan_type` claim, which could be stale after a plan change. Now the `plan_type` field returned by the usage API is treated as authoritative and overrides the JWT value for both CLI list display and scoring (`is_free` / `is_team` gates). TUI table and account-detail popup updated accordingly; JSON `--json` output also reflects the live value
+- **Credits section no longer shows red `$0.00` for Plus accounts** — The API added a `credits.has_credits` boolean; Plus/Pro accounts with no pay-per-use credits return `has_credits: false`. The parser now gates balance extraction on this field, so `credits_balance` stays `None` and the credits row is hidden rather than showing a misleading `$0.00` in red
+- **`credits.balance` string format** — The API changed `balance` from a JSON number to a string (`"0"` instead of `0`). Both formats are now accepted
+- **Warmup "already active" check covers free accounts** — The warmup skip logic in both TUI and CLI only checked the `primary` (5h) window; after the API change free accounts have `primary = None`, causing them to be re-warmed on every invocation. Now both `primary` and `secondary` windows are checked, so a free account with an active 7d window is correctly identified as already active
+- **TUI Quota sort handles free accounts** — `get_5h_used_pct` returned `999.0` when `primary` was absent, pushing free accounts to the bottom of Quota sort regardless of their actual 7d usage. Now falls back to `secondary.used_percent` when `primary` is `None`
+- **JSON output `plan` field** — `account_to_json` now accepts the live API `plan_type` as an override, so `codex-switch list --json` emits the correct plan even when the JWT claim is stale
 
 ## v0.0.15 — 2026-04-29
 
