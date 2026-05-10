@@ -216,13 +216,17 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 UsageStatus::Loaded(u) => {
                     let over_5h = u.primary.as_ref().is_some_and(|w| {
                         let used = w.used_percent.unwrap_or(0.0);
-                        crate::usage::visible_pace_percent(w, crate::usage::WINDOW_5H_SECS)
-                            .is_some_and(|pace| used > pace)
+                        // Suppress pace warning when usage is negligible — a fresh window
+                        // always shows used > pace near t=0, which is noise not a real warning.
+                        used >= 10.0
+                            && crate::usage::visible_pace_percent(w, crate::usage::WINDOW_5H_SECS)
+                                .is_some_and(|pace| used > pace)
                     });
                     let over_7d = u.secondary.as_ref().is_some_and(|w| {
                         let used = w.used_percent.unwrap_or(0.0);
-                        crate::usage::visible_pace_percent(w, crate::usage::WINDOW_7D_SECS)
-                            .is_some_and(|pace| used > pace)
+                        used >= 10.0
+                            && crate::usage::visible_pace_percent(w, crate::usage::WINDOW_7D_SECS)
+                                .is_some_and(|pace| used > pace)
                     });
                     let p5 = u
                         .primary

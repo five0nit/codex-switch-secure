@@ -394,17 +394,29 @@ impl App {
         self.marked.clear();
     }
 
-    /// Returns true if the account has any active rate-limit window (reset in future, usage > 0).
-    /// Checks both 5h (primary) and 7d (secondary) windows — free accounts only have the 7d window.
-    /// Real usage data is authoritative: if a fresh fetch shows `used == 0`, the warmup
-    /// did not stick, even if `cache::is_warmed` flagged a recent attempt as successful
-    /// (server can return 200 OK without actually consuming quota — see #warmup-stuck).
-    /// The disk `warmed_at` flag is only used as a fallback when no usage data exists.
+    /// Returns true if the account has any active rate-limit window (reset in future, usage > 0,
+    /// and the window has been running for at least MIN_WARMUP_ELAPSED_SECS).
+    ///
+    /// A window that appears "just started" (elapsed < 5 min) likely means the previous warmup
+    /// ping didn't consume real quota — allow the user to retry.
     fn is_already_warmed(&self, alias: &str) -> bool {
+        // Minimum elapsed time before we consider a window truly "warmed".
+        // If the countdown is still near the full window duration, the warmup ping likely
+        // didn't trigger real quota consumption on the server side.
+        const MIN_WARMUP_ELAPSED_SECS: i64 = 5 * 60;
+
         let now = crate::auth::now_unix_secs();
 
-        let window_active = |w: &crate::usage::WindowUsage| {
-            w.resets_at.is_some_and(|t| t > now) && w.used_percent.is_some_and(|p| p > 0.0)
+        let window_active = |w: &crate::usage::WindowUsage, window_secs: i64| -> bool {
+            let resets_at = match w.resets_at {
+                Some(t) if t > now => t,
+                _ => return false,
+            };
+            if w.used_percent.unwrap_or(0.0) <= 0.0 {
+                return false;
+            }
+            let elapsed = window_secs - (resets_at - now);
+            elapsed >= MIN_WARMUP_ELAPSED_SECS
         };
 
         // Prefer in-memory loaded usage — most authoritative.
@@ -413,15 +425,21 @@ impl App {
                 continue;
             }
             if let UsageStatus::Loaded(u) = &a.usage {
-                return u.primary.as_ref().is_some_and(|w| window_active(w))
-                    || u.secondary.as_ref().is_some_and(|w| window_active(w));
+                return u.primary.as_ref().is_some_and(|w| {
+                    window_active(w, crate::usage::WINDOW_5H_SECS)
+                }) || u.secondary.as_ref().is_some_and(|w| {
+                    window_active(w, crate::usage::WINDOW_7D_SECS)
+                });
             }
         }
 
         // No loaded data: fall back to disk-cached usage.
         if let Some(u) = crate::cache::get(alias) {
-            return u.primary.as_ref().is_some_and(|w| window_active(w))
-                || u.secondary.as_ref().is_some_and(|w| window_active(w));
+            return u.primary.as_ref().is_some_and(|w| {
+                window_active(w, crate::usage::WINDOW_5H_SECS)
+            }) || u.secondary.as_ref().is_some_and(|w| {
+                window_active(w, crate::usage::WINDOW_7D_SECS)
+            });
         }
 
         // No usage data anywhere: trust the recent-warmup flag.

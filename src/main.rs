@@ -1267,7 +1267,7 @@ fn print_usage_line(u: &usage::UsageInfo) {
         let pct = w.used_percent.unwrap_or(0.0);
         let remaining_pct = (100.0 - pct).max(0.0);
         let pace = usage::visible_pace_percent(w, usage::WINDOW_5H_SECS);
-        let over = pace.is_some_and(|p| pct > p);
+        let over = pct >= 10.0 && pace.is_some_and(|p| pct > p);
         let bar = render_progress_bar(pct, pace, bar_width);
         let reset = format_reset_short_relative(w);
         let warn = if over { color::error("!") } else { String::new() };
@@ -1283,7 +1283,7 @@ fn print_usage_line(u: &usage::UsageInfo) {
         let pct = w.used_percent.unwrap_or(0.0);
         let remaining_pct = (100.0 - pct).max(0.0);
         let pace = usage::visible_pace_percent(w, usage::WINDOW_7D_SECS);
-        let over = pace.is_some_and(|p| pct > p);
+        let over = pct >= 10.0 && pace.is_some_and(|p| pct > p);
         let bar = render_progress_bar(pct, pace, bar_width);
         let reset = format_reset_short_relative(w);
         let warn = if over { color::error("!") } else { String::new() };
@@ -1331,21 +1331,29 @@ async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
 
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(aliases.len());
 
-    // Filter out accounts that have any active rate-limit window (reset in future, usage > 0).
-    // Checks both 5h (primary) and 7d (secondary) — free accounts only have the 7d window.
-    // Real usage is authoritative: a 200 OK warmup can leave `warmed_at` set without
-    // actually consuming quota, so trust cached usage data first; the `warmed_at` flag
-    // is only a fallback when no usage data exists.
+    // Filter out accounts that have any active rate-limit window (reset in future, usage > 0,
+    // and the window has been running for at least MIN_ELAPSED_SECS).
+    // A window that appears "just started" (elapsed < 5 min) likely means the previous warmup
+    // ping didn't consume real quota — allow the user to retry.
     let now = auth::now_unix_secs();
-    let window_active = |w: &usage::WindowUsage| {
-        w.resets_at.is_some_and(|t| t > now) && w.used_percent.is_some_and(|p| p > 0.0)
+    const MIN_WARMUP_ELAPSED_SECS: i64 = 5 * 60;
+    let window_active = |w: &usage::WindowUsage, window_secs: i64| -> bool {
+        let resets_at = match w.resets_at {
+            Some(t) if t > now => t,
+            _ => return false,
+        };
+        if w.used_percent.unwrap_or(0.0) <= 0.0 { return false; }
+        let elapsed = window_secs - (resets_at - now);
+        elapsed >= MIN_WARMUP_ELAPSED_SECS
     };
     let mut to_warmup = Vec::new();
     for alias in &aliases {
         let cached_usage = cache::get(alias);
         let already_active = match cached_usage {
-            Some(u) => u.primary.as_ref().is_some_and(|w| window_active(w))
-                || u.secondary.as_ref().is_some_and(|w| window_active(w)),
+            Some(u) => {
+                u.primary.as_ref().is_some_and(|w| window_active(w, usage::WINDOW_5H_SECS))
+                    || u.secondary.as_ref().is_some_and(|w| window_active(w, usage::WINDOW_7D_SECS))
+            }
             None => cache::is_warmed(alias),
         };
         if already_active {
