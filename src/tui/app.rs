@@ -1237,6 +1237,9 @@ async fn perform_oauth(
     // Tear down TUI: restore cooked mode + clear screen so the OAuth output
     // (browser prompts, device user_code, polling progress) is visible.
     ratatui::restore();
+    // TUI starts with MessageMode::Silent; switch to Stdout so login.rs
+    // user_println calls (device code URL, user_code) are actually shown.
+    crate::output::set_message_mode(crate::output::MessageMode::Stdout);
 
     let mode_name = match &mode {
         OAuthMode::Add => "Add new account".to_string(),
@@ -1263,7 +1266,8 @@ async fn perform_oauth(
         .await;
     }
 
-    // Restore TUI.
+    // Restore silent mode before reinitializing TUI.
+    crate::output::set_message_mode(crate::output::MessageMode::Silent);
     *terminal = ratatui::init();
 
     match result {
@@ -1295,6 +1299,7 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     }
 
     ratatui::restore();
+    crate::output::set_message_mode(crate::output::MessageMode::Stdout);
 
     let total = aliases.len();
     println!("\n=== Batch re-login: {total} account(s) ===");
@@ -1335,6 +1340,7 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     })
     .await;
 
+    crate::output::set_message_mode(crate::output::MessageMode::Silent);
     *terminal = ratatui::init();
 
     app.marked.clear();

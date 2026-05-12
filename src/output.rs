@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Serialize;
@@ -234,13 +235,16 @@ pub fn format_local_time(ts: i64) -> String {
 // ── Output ───────────────────────────────────────────────
 
 static JSON_PRETTY: OnceLock<bool> = OnceLock::new();
-static MESSAGE_MODE: OnceLock<MessageMode> = OnceLock::new();
+
+// 0 = Stdout, 1 = Stderr, 2 = Silent
+static MESSAGE_MODE: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Debug, Clone, Copy)]
+#[repr(u8)]
 pub enum MessageMode {
-    Stdout,
-    Stderr,
-    Silent,
+    Stdout = 0,
+    Stderr = 1,
+    Silent = 2,
 }
 
 /// Set JSON output mode. Call once at startup.
@@ -249,7 +253,7 @@ pub fn set_json_pretty(pretty: bool) {
 }
 
 pub fn set_message_mode(mode: MessageMode) {
-    let _ = MESSAGE_MODE.set(mode);
+    MESSAGE_MODE.store(mode as u8, Ordering::Relaxed);
 }
 
 fn is_pretty() -> bool {
@@ -257,7 +261,11 @@ fn is_pretty() -> bool {
 }
 
 fn message_mode() -> MessageMode {
-    *MESSAGE_MODE.get().unwrap_or(&MessageMode::Stdout)
+    match MESSAGE_MODE.load(Ordering::Relaxed) {
+        1 => MessageMode::Stderr,
+        2 => MessageMode::Silent,
+        _ => MessageMode::Stdout,
+    }
 }
 
 fn serialize<T: serde::Serialize>(val: &T) -> String {
