@@ -107,13 +107,20 @@ pub fn warmup_window_active(w: &WindowUsage, window_secs: i64, now: i64) -> bool
     elapsed >= MIN_WARMUP_ELAPSED_SECS
 }
 
+/// Decide whether warmup should be skipped because the relevant window is already active.
+///
+/// Paid accounts have both 5h (primary) and 7d (secondary) windows; only the 5h window
+/// is what warmup is meant to (re)open, so a still-active 7d window must NOT suppress
+/// warmup once the 5h window has closed. Free accounts only have the 7d window, so it
+/// is the only signal available.
 pub fn usage_has_active_warmup_window(u: &UsageInfo, now: i64) -> bool {
-    u.primary
-        .as_ref()
-        .is_some_and(|w| warmup_window_active(w, WINDOW_5H_SECS, now))
-        || u.secondary
+    match u.primary.as_ref() {
+        Some(w) => warmup_window_active(w, WINDOW_5H_SECS, now),
+        None => u
+            .secondary
             .as_ref()
-            .is_some_and(|w| warmup_window_active(w, WINDOW_7D_SECS, now))
+            .is_some_and(|w| warmup_window_active(w, WINDOW_7D_SECS, now)),
+    }
 }
 
 /// Calculate pace: the expected used_percent if consumption were even across the window.
@@ -1451,5 +1458,58 @@ mod tests {
 
         assert!(!warmup_window_active(&no_usage, WINDOW_5H_SECS, now));
         assert!(!warmup_window_active(&no_reset, WINDOW_5H_SECS, now));
+    }
+
+    #[test]
+    fn test_paid_account_with_expired_5h_but_active_7d_is_not_already_warmed() {
+        // Regression: previously OR-ed primary and secondary, so a paid account
+        // whose 7d window was still active (the normal case after any real use)
+        // would never re-warm after its 5h window expired.
+        let now = 1_000_000i64;
+        let expired_5h = WindowUsage {
+            used_percent: Some(99.0),
+            resets_at: Some(now - 60), // already reset server-side
+        };
+        let active_7d = WindowUsage {
+            used_percent: Some(40.0),
+            resets_at: Some(now + WINDOW_7D_SECS - MIN_WARMUP_ELAPSED_SECS),
+        };
+        let u = UsageInfo {
+            primary: Some(expired_5h),
+            secondary: Some(active_7d),
+            ..Default::default()
+        };
+        assert!(!usage_has_active_warmup_window(&u, now));
+    }
+
+    #[test]
+    fn test_paid_account_with_active_5h_is_already_warmed() {
+        let now = 1_000_000i64;
+        let active_5h = WindowUsage {
+            used_percent: Some(20.0),
+            resets_at: Some(now + WINDOW_5H_SECS - MIN_WARMUP_ELAPSED_SECS),
+        };
+        let u = UsageInfo {
+            primary: Some(active_5h),
+            secondary: None,
+            ..Default::default()
+        };
+        assert!(usage_has_active_warmup_window(&u, now));
+    }
+
+    #[test]
+    fn test_free_account_falls_back_to_7d_window() {
+        // Free accounts have primary=None (remapped to secondary in parse_usage).
+        let now = 1_000_000i64;
+        let active_7d = WindowUsage {
+            used_percent: Some(10.0),
+            resets_at: Some(now + WINDOW_7D_SECS - MIN_WARMUP_ELAPSED_SECS),
+        };
+        let u = UsageInfo {
+            primary: None,
+            secondary: Some(active_7d),
+            ..Default::default()
+        };
+        assert!(usage_has_active_warmup_window(&u, now));
     }
 }
