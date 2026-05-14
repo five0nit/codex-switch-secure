@@ -159,6 +159,12 @@ pub const KEYMAP: &[Binding] = &[
         in_status_bar: false,
     },
     Binding {
+        keys: "W",
+        section: Section::Global,
+        label: "toggle auto-warmup (auto-refresh + warm whenever 5h expires)",
+        in_status_bar: false,
+    },
+    Binding {
         keys: "h",
         section: Section::Global,
         label: "show this help",

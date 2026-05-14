@@ -304,6 +304,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(secs) = app.auto_refresh_remaining_secs() {
         title.push_str(&format!(" auto:{}", format_auto_refresh_remaining(secs)));
+        if app.auto_warmup_enabled {
+            title.push_str("+warm");
+        }
     }
     title.push_str(&format!(" sort:{} ", app.sort_mode.as_str()));
 

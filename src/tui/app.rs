@@ -94,6 +94,7 @@ pub struct App {
     pub auto_refresh_enabled: bool,
     pub auto_refresh_interval: Duration,
     pub next_auto_refresh: Option<Instant>,
+    pub auto_warmup_enabled: bool,
     pub help_popup: Option<super::popup::PopupState>,
     pub menu: Option<super::menu::MenuState>,
 }
@@ -127,6 +128,7 @@ impl App {
             auto_refresh_enabled: false,
             auto_refresh_interval: Duration::from_secs(cfg.tui.auto_refresh_interval_secs),
             next_auto_refresh: None,
+            auto_warmup_enabled: false,
             help_popup: None,
             menu: None,
         }
@@ -969,6 +971,29 @@ impl App {
         }
     }
 
+    /// Toggle auto-warmup. Auto-warmup piggybacks on the auto-refresh tick: every
+    /// refresh cycle it calls `warmup_all`, which spawns warmup for any account
+    /// whose 5h window has expired (paid) or 7d window has expired (free).
+    /// Enabling auto-warmup turns on auto-refresh if it is off — without refresh,
+    /// the warmup pass has no fresh usage data to decide eligibility.
+    pub fn toggle_auto_warmup(&mut self) {
+        self.auto_warmup_enabled = !self.auto_warmup_enabled;
+        if self.auto_warmup_enabled {
+            let mut msg = "Auto warmup on".to_string();
+            if !self.auto_refresh_enabled {
+                self.auto_refresh_enabled = true;
+                self.next_auto_refresh = Some(Instant::now());
+                msg.push_str(&format!(
+                    " (also enabled auto-refresh every {}s)",
+                    self.auto_refresh_interval_secs()
+                ));
+            }
+            self.set_status(msg, 4);
+        } else {
+            self.set_status("Auto warmup off".to_string(), 3);
+        }
+    }
+
     pub fn run_due_auto_refresh(&mut self) {
         if !self.auto_refresh_enabled {
             return;
@@ -986,7 +1011,11 @@ impl App {
 
         self.load_profiles_preserving_selection();
         let account_count = self.accounts.len();
-        let warmup_count = self.warmup_all();
+        let warmup_count = if self.auto_warmup_enabled {
+            self.warmup_all()
+        } else {
+            0
+        };
         self.refresh_all(true);
         self.next_auto_refresh = Some(now + self.auto_refresh_interval);
 
@@ -1069,6 +1098,19 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             }
             if app.search_active {
                 app.handle_search_key(key.code);
+                continue;
+            }
+
+            // Capital 'W' is a distinct global binding (toggle auto-warmup),
+            // separate from menu 'w' (per-account warmup). Detect it before
+            // case normalization so it survives the lowercase dispatch below.
+            // Only meaningful in the main view (no popup/menu/confirm overlay).
+            if matches!(key.code, KeyCode::Char('W'))
+                && app.help_popup.is_none()
+                && app.menu.is_none()
+                && app.confirm.is_none()
+            {
+                app.toggle_auto_warmup();
                 continue;
             }
 
