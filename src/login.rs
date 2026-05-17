@@ -545,10 +545,8 @@ pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> serde_json::Va
 ///   1. 127.0.0.1:1455  — the port OpenAI registers as the primary redirect URI.
 ///   2. [::1]:1455       — Windows IPv4-only port exclusions don't block IPv6;
 ///                         browsers use Happy Eyeballs and reach the IPv6 socket.
-///   3. 127.0.0.1:0      — OS-assigned random port; OpenAI's auth server follows
-///                         RFC 8252 and accepts any loopback port for native apps.
+///   3. Error with remediation hint (Windows: net stop/start winnat + hns).
 async fn bind_callback_listener() -> Result<(TcpListener, u16)> {
-    // 1. Preferred: fixed port on IPv4.
     match TcpListener::bind(format!("{CALLBACK_HOST}:{CALLBACK_PORT}")).await {
         Ok(l) => return Ok((l, CALLBACK_PORT)),
         Err(e) => {
@@ -559,15 +557,10 @@ async fn bind_callback_listener() -> Result<(TcpListener, u16)> {
 }
 
 #[cfg(target_os = "windows")]
-fn listener_port(l: &TcpListener) -> Result<u16> {
-    Ok(l.local_addr().context("getting listener port")?.port())
-}
-
-#[cfg(target_os = "windows")]
 async fn bind_callback_listener_fallback(ipv4_err: std::io::Error) -> Result<(TcpListener, u16)> {
-    // WSAEACCES (10013): port blocked by Windows (excluded range, SO_EXCLUSIVEADDRUSE, etc.)
     if ipv4_err.raw_os_error() == Some(10013) {
-        // 2. Try IPv6 loopback on the same port — Windows exclusions are IPv4-only.
+        // WSAEACCES (10013): port blocked by Windows (excluded range, WinNAT, HNS, etc.)
+        // Try IPv6 loopback — Windows port exclusions are IPv4-only.
         match TcpListener::bind(format!("[::1]:{CALLBACK_PORT}")).await {
             Ok(l) => {
                 user_println(&format!(
@@ -581,28 +574,12 @@ async fn bind_callback_listener_fallback(ipv4_err: std::io::Error) -> Result<(Tc
             }
         }
 
-        // 3. Fall back to a random OS-assigned port (RFC 8252 loopback).
-        match TcpListener::bind(format!("{CALLBACK_HOST}:0")).await {
-            Ok(l) => {
-                let port = listener_port(&l)?;
-                user_println(&format!(
-                    "Note: port {CALLBACK_PORT} blocked on Windows; \
-                    using random port {port} (RFC 8252 loopback)."
-                ));
-                return Ok((l, port));
-            }
-            Err(e0) => {
-                return Err(anyhow::anyhow!(
-                    "Cannot bind callback port — all fallbacks failed.\n\
-                    \n  IPv4 {CALLBACK_PORT}: {ipv4_err}\
-                    \n  IPv6 {CALLBACK_PORT}: (see above)\
-                    \n  Random port:  {e0}\
-                    \n\nCheck if another process holds port {CALLBACK_PORT}:\
-                    \n  netstat -ano | findstr :{CALLBACK_PORT}\
-                    \n\nOr use device code flow:\n  codex-switch login --device"
-                ));
-            }
-        }
+        return Err(anyhow::anyhow!(
+            "Cannot bind port {CALLBACK_PORT}: blocked by Windows (WinNAT / HNS port reservation).\n\
+            \nRun the following as Administrator to release reserved ports, then retry:\n\
+            \n  net stop winnat\n  net stop hns\n  net start winnat\n  net start hns\
+            \n\nOr use device code flow (no port needed):\n  codex-switch login --device"
+        ));
     }
 
     Err(anyhow::anyhow!(
