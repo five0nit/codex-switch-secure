@@ -9,21 +9,7 @@ use anyhow::Result;
 
 pub async fn dispatch(cmd: DaemonCommand) -> Result<()> {
     match cmd {
-        DaemonCommand::Start { foreground } => {
-            if pidfile::is_daemon_running() {
-                anyhow::bail!(
-                    "Daemon is already running (PID {})",
-                    pidfile::read_pidfile().unwrap_or(0)
-                );
-            }
-            // Clean up stale PID file before starting
-            pidfile::cleanup_pidfile()?;
-            if foreground {
-                run_foreground().await
-            } else {
-                start_detached()
-            }
-        }
+        DaemonCommand::Start { foreground } => start(foreground).await,
         DaemonCommand::Stop => stop(),
         DaemonCommand::Status => status(),
         DaemonCommand::Install => service::install(),
@@ -31,6 +17,34 @@ pub async fn dispatch(cmd: DaemonCommand) -> Result<()> {
     }
 }
 
+async fn start(foreground: bool) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = foreground;
+        anyhow::bail!(
+            "The background daemon is only supported on Unix (macOS/Linux). \
+             On Windows, run codex-switch commands directly or use Task Scheduler."
+        );
+    }
+    #[cfg(unix)]
+    {
+        if pidfile::is_daemon_running() {
+            anyhow::bail!(
+                "Daemon is already running (PID {})",
+                pidfile::read_pidfile().unwrap_or(0)
+            );
+        }
+        // Clean up stale PID file before starting
+        pidfile::cleanup_pidfile()?;
+        if foreground {
+            run_foreground().await
+        } else {
+            start_detached()
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn run_foreground() -> Result<()> {
     pidfile::write_pidfile_exclusive()?;
     // RAII guard ensures PID file is cleaned up even on panic
@@ -39,9 +53,10 @@ async fn run_foreground() -> Result<()> {
     loop_runner::run_daemon_loop().await
 }
 
+#[cfg(unix)]
 fn start_detached() -> Result<()> {
     let exe = std::env::current_exe()?;
-    let child = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .args(["daemon", "start", "--foreground"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -49,15 +64,28 @@ fn start_detached() -> Result<()> {
         .spawn()?;
 
     let pid = child.id();
-    // Give the child a moment to detect startup failures
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    if !pidfile::process_alive(pid) {
-        anyhow::bail!(
-            "Daemon process (PID {pid}) exited immediately after start; check logs for details"
-        );
+    // Wait for the daemon to write its PID file, which signals it reached the
+    // event loop. Polling the actual readiness signal is more reliable than a
+    // fixed sleep on slow disks / CI / containers.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        // Did the child exit before initializing?
+        if let Ok(Some(status)) = child.try_wait() {
+            anyhow::bail!(
+                "Daemon process (PID {pid}) exited immediately ({status}); check logs for details"
+            );
+        }
+        if pidfile::read_pidfile() == Some(pid) {
+            user_println(&format!("Daemon started (PID {pid})"));
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Daemon (PID {pid}) did not initialize within 2s (no PID file written); check logs"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    user_println(&format!("Daemon started (PID {pid})"));
-    Ok(())
 }
 
 fn stop() -> Result<()> {

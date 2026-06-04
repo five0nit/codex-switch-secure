@@ -13,8 +13,8 @@ pub fn write_pidfile_exclusive() -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // create_new(true) → O_CREAT | O_EXCL: atomic, fails if file exists
-    std::fs::OpenOptions::new()
+    // create_new(true) → O_CREAT | O_EXCL: atomic, fails if file exists.
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
@@ -28,7 +28,11 @@ pub fn write_pidfile_exclusive() -> Result<()> {
                 anyhow::anyhow!("Failed to create PID file {}: {e}", path.display())
             }
         })?;
-    std::fs::write(&path, std::process::id().to_string())?;
+    // Write the PID through the just-opened handle (no reopen) so a concurrent
+    // reader never observes the file in a created-but-empty state.
+    use std::io::Write;
+    file.write_all(std::process::id().to_string().as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to write PID to {}: {e}", path.display()))?;
     Ok(())
 }
 
