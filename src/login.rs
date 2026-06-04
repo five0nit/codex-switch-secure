@@ -73,21 +73,7 @@ fn redirect_uri(port: u16) -> String {
 }
 
 fn redacted_device_poll_log_body(body: &serde_json::Value) -> String {
-    let mut value = body.clone();
-    if let Some(obj) = value.as_object_mut() {
-        for key in &[
-            "authorization_code",
-            "code_verifier",
-            "access_token",
-            "refresh_token",
-            "id_token",
-        ] {
-            if obj.contains_key(*key) {
-                obj.insert((*key).to_string(), serde_json::json!("***"));
-            }
-        }
-    }
-    serde_json::to_string(&value).unwrap_or_default()
+    crate::auth::redact_sensitive_log_body(body)
 }
 
 // ── Main flow ─────────────────────────────────────────────
@@ -542,13 +528,13 @@ pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> serde_json::Va
 /// Bind the PKCE callback listener and return `(listener, actual_port)`.
 ///
 /// Preference order:
-///   1. 127.0.0.1:1455  — the port OpenAI registers as the primary redirect URI.
-///   2. [::1]:1455       — Windows IPv4-only port exclusions don't block IPv6;
-///                         browsers use Happy Eyeballs and reach the IPv6 socket.
-///   3. Error with remediation hint (Windows: net stop/start winnat + hns).
+/// 1. `127.0.0.1:1455` — the port OpenAI registers as the primary redirect URI.
+/// 2. `[::1]:1455` — Windows IPv4-only port exclusions don't block IPv6; browsers
+///    use Happy Eyeballs and reach the IPv6 socket.
+/// 3. Error with remediation hint (Windows: net stop/start winnat + hns).
 async fn bind_callback_listener() -> Result<(TcpListener, u16)> {
     match TcpListener::bind(format!("{CALLBACK_HOST}:{CALLBACK_PORT}")).await {
-        Ok(l) => return Ok((l, CALLBACK_PORT)),
+        Ok(l) => Ok((l, CALLBACK_PORT)),
         Err(e) => {
             debug!("IPv4 bind on {CALLBACK_PORT} failed: {e}");
             bind_callback_listener_fallback(e).await

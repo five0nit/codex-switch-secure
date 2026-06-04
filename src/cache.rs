@@ -152,6 +152,25 @@ pub fn put(alias: &str, usage: &UsageInfo) {
     }
 }
 
+/// Async wrapper around [`get`]: runs the blocking lock + file read on a
+/// dedicated blocking thread so it never stalls a tokio worker. Use this on
+/// the high-concurrency usage-fetch path (up to `network.max_concurrent`
+/// tasks) instead of calling [`get`] directly inside an async task.
+pub async fn get_async(alias: &str) -> Option<UsageInfo> {
+    let alias = alias.to_string();
+    tokio::task::spawn_blocking(move || get(&alias))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Async wrapper around [`put`]; see [`get_async`] for rationale.
+pub async fn put_async(alias: &str, usage: &UsageInfo) {
+    let alias = alias.to_string();
+    let usage = usage.clone();
+    let _ = tokio::task::spawn_blocking(move || put(&alias, &usage)).await;
+}
+
 /// Get the last-used timestamp for an alias (0 if never used).
 pub fn get_last_used(alias: &str) -> i64 {
     let _lock = match CACHE_LOCK.lock() {

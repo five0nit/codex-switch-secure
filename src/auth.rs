@@ -81,14 +81,43 @@ pub fn write_auth(path: &Path, val: &serde_json::Value) -> Result<()> {
         }
     }
     let raw = serde_json::to_string_pretty(val)?;
-    std::fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    // Atomic write: write to a temp file, set restrictive perms, then rename.
+    // A direct `fs::write` is non-atomic — a crash mid-write would leave a
+    // truncated auth.json that Codex cannot parse. Permissions are applied to
+    // the temp file before rename so the final file is never world-readable.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting permissions on {}", path.display()))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", tmp.display()))?;
     }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+/// Mask sensitive token/credential fields in a JSON body before logging.
+/// Used by debug-level logs that may otherwise leak access/refresh/id tokens
+/// when users share `--debug` output (e.g. in a bug report).
+pub(crate) fn redact_sensitive_log_body(body: &serde_json::Value) -> String {
+    let mut value = body.clone();
+    if let Some(obj) = value.as_object_mut() {
+        for key in &[
+            "authorization_code",
+            "code_verifier",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "client_secret",
+        ] {
+            if obj.contains_key(*key) {
+                obj.insert((*key).to_string(), serde_json::json!("***"));
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_default()
 }
 
 pub fn sha256_file(path: &Path) -> Option<String> {

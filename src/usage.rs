@@ -265,7 +265,7 @@ async fn fetch_usage_retried_inner(
     force: bool,
 ) -> std::result::Result<UsageInfo, UsageError> {
     if !force {
-        if let Some(cached) = crate::cache::get(alias) {
+        if let Some(cached) = crate::cache::get_async(alias).await {
             debug!("{alias}: cache hit");
             return Ok(cached);
         }
@@ -305,7 +305,7 @@ async fn fetch_usage_retried_inner(
                 if let Some(new_tokens) = refreshed {
                     persist_refreshed_tokens(alias, profile_path, &new_tokens);
                 }
-                crate::cache::put(alias, &usage);
+                crate::cache::put_async(alias, &usage).await;
                 return Ok(usage);
             }
             Err(e) => {
@@ -358,7 +358,10 @@ pub async fn fetch_usage_with_refresh(
                     let body: Value = resp.json().await.map_err(|e| {
                         anyhow::anyhow!("failed to parse usage response (HTTP {status}): {e}")
                     })?;
-                    debug!("[{alias}] Usage API raw body (proactive): {}", body);
+                    debug!(
+                        "[{alias}] Usage API raw body (proactive): {}",
+                        crate::auth::redact_sensitive_log_body(&body)
+                    );
                     return Ok((parse_usage(&body), Some(new_tokens)));
                 }
                 anyhow::bail!("Usage API failed (HTTP {status}) after proactive token refresh");
@@ -383,7 +386,10 @@ pub async fn fetch_usage_with_refresh(
             .json()
             .await
             .map_err(|e| anyhow::anyhow!("failed to parse usage response (HTTP {status}): {e}"))?;
-        debug!("[{alias}] Usage API raw body: {}", body);
+        debug!(
+            "[{alias}] Usage API raw body: {}",
+            crate::auth::redact_sensitive_log_body(&body)
+        );
         return Ok((parse_usage(&body), None));
     }
 
@@ -514,12 +520,12 @@ pub(crate) async fn do_refresh_token(
     })?;
 
     let r: RefreshResponse = serde_json::from_str(&body_text).map_err(|e| {
-        let preview = if body_text.len() > 200 {
-            format!("{}...(truncated)", &body_text[..200])
-        } else {
-            body_text.clone()
-        };
-        debug!("[{alias}] token refresh parse failure, raw body: {preview}");
+        // A token refresh body may contain access/refresh/id tokens; redact them
+        // before logging so `--debug` output is safe to share in bug reports.
+        let redacted = serde_json::from_str::<Value>(&body_text)
+            .map(|v| crate::auth::redact_sensitive_log_body(&v))
+            .unwrap_or_else(|_| format!("<non-JSON body, {} bytes>", body_text.len()));
+        debug!("[{alias}] token refresh parse failure, raw body: {redacted}");
         anyhow::anyhow!("Failed to parse token refresh response (HTTP {status}): {e}")
     })?;
 
