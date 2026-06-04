@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.0.18 — 2026-06-04
+
+### Fixed
+
+- **`auth.json` is now written atomically** — `write_auth` writes to a temp file (with `0600` permissions applied before the swap) and `rename`s it into place, matching the cache writer. A crash or full disk mid-write can no longer leave a truncated `auth.json` that Codex fails to parse. This path runs on every profile switch, token refresh, and relogin.
+- **`launch` no longer races or leaks its auth backup** — The temporary backup uses a unique per-invocation name (PID + timestamp) so two concurrent `launch` commands cannot clobber each other's backup, and the backup is set to `0600` so other local users cannot read its tokens during the restore window. Pressing Ctrl+C during the restore delay now restores the original `auth.json` before exiting instead of leaving the staged profile in place.
+- **`daemon start` reliability** — Detached start now polls for the daemon's PID file (up to 2s) instead of a fixed 200ms liveness probe, so slow disks / CI / containers no longer report a false "exited immediately". `daemon start` now returns a clear "Unix only" error on Windows rather than silently appearing to succeed while the daemon cannot be managed.
+- **PID file write is atomic** — The PID is written through the just-created exclusive file handle, closing the window where a concurrent reader could see a created-but-empty PID file and mis-detect the daemon as not running.
+
+### Security
+
+- **Token-bearing debug logs are redacted** — `--debug` / `RUST_LOG=debug` output no longer prints raw access/refresh/id tokens from token-refresh and usage responses; sensitive fields are masked, so debug output is safe to share in bug reports.
+
+### Changed
+
+- **Dependency refresh** — Updated all transitive dependencies within their semver ranges (`rustls`, `tokio`, `hyper`, `reqwest`, and others). `cargo audit` reports no vulnerabilities.
+- **Cache I/O moved off the async hot path** — On the high-concurrency usage-fetch path, cache reads/writes now run on a blocking thread so they no longer stall tokio workers when many profiles are refreshed at once.
+- Resolved all outstanding `clippy` warnings.
+
 ## v0.0.17 — 2026-05-11
 
 ### Fixed
