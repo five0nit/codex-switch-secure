@@ -220,8 +220,8 @@ impl MenuState {
                     Some(e) => format!("{alias}  ({e})"),
                     None => alias.clone(),
                 };
-                let mut lines: Vec<Line<'static>> = Vec::new();
-                lines.push(Line::from(Span::styled(header, header_style)));
+                let mut lines: Vec<Line<'static>> =
+                    vec![Line::from(Span::styled(header, header_style))];
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "Choose OAuth flow:",

@@ -812,13 +812,12 @@ impl App {
                 }
                 return false;
             }
-            KeyCode::Backspace => {
-                if state.cursor > 0 {
+            KeyCode::Backspace
+                if state.cursor > 0 => {
                     state.cursor -= 1;
                     let byte_pos = char_to_byte(&state.input, state.cursor);
                     state.input.remove(byte_pos);
                 }
-            }
             KeyCode::Delete => {
                 let char_count = state.input.chars().count();
                 if state.cursor < char_count {
@@ -826,11 +825,10 @@ impl App {
                     state.input.remove(byte_pos);
                 }
             }
-            KeyCode::Left => {
-                if state.cursor > 0 {
+            KeyCode::Left
+                if state.cursor > 0 => {
                     state.cursor -= 1;
                 }
-            }
             KeyCode::Right => {
                 let char_count = state.input.chars().count();
                 if state.cursor < char_count {
@@ -870,13 +868,12 @@ impl App {
                 KeyCode::Enter => {
                     accept_search = true;
                 }
-                KeyCode::Backspace => {
-                    if state.cursor > 0 {
+                KeyCode::Backspace
+                    if state.cursor > 0 => {
                         state.cursor -= 1;
                         let byte_pos = char_to_byte(&state.query, state.cursor);
                         state.query.remove(byte_pos);
                     }
-                }
                 KeyCode::Delete => {
                     let char_count = state.query.chars().count();
                     if state.cursor < char_count {
@@ -884,11 +881,10 @@ impl App {
                         state.query.remove(byte_pos);
                     }
                 }
-                KeyCode::Left => {
-                    if state.cursor > 0 {
+                KeyCode::Left
+                    if state.cursor > 0 => {
                         state.cursor -= 1;
                     }
-                }
                 KeyCode::Right => {
                     let char_count = state.query.chars().count();
                     if state.cursor < char_count {
@@ -1153,16 +1149,14 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         app.clear_marks();
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if app.selected + 1 < app.view_indices.len() {
+                KeyCode::Down | KeyCode::Char('j')
+                    if app.selected + 1 < app.view_indices.len() => {
                         app.selected += 1;
                     }
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if app.selected > 0 {
+                KeyCode::Up | KeyCode::Char('k')
+                    if app.selected > 0 => {
                         app.selected -= 1;
                     }
-                }
                 KeyCode::Enter => {
                     if app.marked.is_empty() {
                         app.open_account_menu();
