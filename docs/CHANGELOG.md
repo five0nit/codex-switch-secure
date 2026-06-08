@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.0.18 — 2026-06-04
+## v0.0.18 — 2026-06-08
 
 ### Fixed
 
@@ -8,6 +8,7 @@
 - **`launch` no longer races or leaks its auth backup** — The temporary backup uses a unique per-invocation name (PID + timestamp) so two concurrent `launch` commands cannot clobber each other's backup, and the backup is set to `0600` so other local users cannot read its tokens during the restore window. Pressing Ctrl+C during the restore delay now restores the original `auth.json` before exiting instead of leaving the staged profile in place.
 - **`daemon start` reliability** — Detached start now polls for the daemon's PID file (up to 2s) instead of a fixed 200ms liveness probe, so slow disks / CI / containers no longer report a false "exited immediately". `daemon start` now returns a clear "Unix only" error on Windows rather than silently appearing to succeed while the daemon cannot be managed.
 - **PID file write is atomic** — The PID is written through the just-created exclusive file handle, closing the window where a concurrent reader could see a created-but-empty PID file and mis-detect the daemon as not running.
+- **TUI first-run account setup** — `codex-switch tui` no longer exits with a CLI hint when no profiles exist. The TUI now opens normally and shows an empty-state prompt ("No accounts yet. Press 'a' to add one") so users can add their first account without leaving the TUI.
 
 ### Security
 
