@@ -125,6 +125,7 @@ fn run_cmd(env: &TestEnv, args: &[&str]) -> Output {
         .args(args)
         .env("HOME", &env.home)
         .env("CODEX_HOME", &env.codex_home)
+        .env("CS_ALLOW_INSECURE_ENDPOINT_OVERRIDES", "1")
         .env("CS_USAGE_URL", &env.usage_url)
         .env("CS_TOKEN_URL", &env.token_url)
         .env("NO_COLOR", "1")

@@ -180,7 +180,11 @@ impl std::fmt::Display for UsageError {
 }
 
 fn usage_url() -> String {
-    std::env::var("CS_USAGE_URL").unwrap_or_else(|_| USAGE_URL.to_string())
+    if crate::auth::allow_insecure_endpoint_overrides() {
+        std::env::var("CS_USAGE_URL").unwrap_or_else(|_| USAGE_URL.to_string())
+    } else {
+        USAGE_URL.to_string()
+    }
 }
 
 /// Extract a short summary from an error message for user-facing display.

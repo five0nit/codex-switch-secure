@@ -13,8 +13,26 @@ pub(crate) const USER_AGENT: &str = "codex/0.2.0";
 pub(crate) const ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
+/// Local security guard for Mike's fork.
+///
+/// The upstream tool allows endpoint overrides through environment variables,
+/// which is useful for integration tests but dangerous on an operator machine:
+/// a poisoned shell environment could redirect OAuth refresh tokens or Codex
+/// usage bearer tokens to an attacker-controlled server. Keep overrides off by
+/// default and require an explicit opt-in for tests/dev harnesses.
+pub(crate) fn allow_insecure_endpoint_overrides() -> bool {
+    std::env::var("CS_ALLOW_INSECURE_ENDPOINT_OVERRIDES")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 pub(crate) fn token_url() -> String {
-    std::env::var("CS_TOKEN_URL").unwrap_or_else(|_| DEFAULT_TOKEN_URL.to_string())
+    if allow_insecure_endpoint_overrides() {
+        std::env::var("CS_TOKEN_URL").unwrap_or_else(|_| DEFAULT_TOKEN_URL.to_string())
+    } else {
+        DEFAULT_TOKEN_URL.to_string()
+    }
 }
 
 /// ~/.codex/auth.json (or $CODEX_HOME/auth.json)
