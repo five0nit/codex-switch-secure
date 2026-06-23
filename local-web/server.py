@@ -145,6 +145,52 @@ def set_account_label(alias: str, label: str) -> dict:
         return acct
 
 
+def parse_profiles_from_output(stdout: str) -> list[dict]:
+    parsed = json_from_mixed_stdout(stdout)
+    if isinstance(parsed, dict) and isinstance(parsed.get("profiles"), list):
+        return parsed["profiles"]
+    return []
+
+
+def remove_account(alias: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+        raise ValueError("invalid alias")
+
+    removed_config = False
+    with config_lock:
+        cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else _default_config()
+        before = len(cfg.get("accounts", []))
+        cfg["accounts"] = [a for a in cfg.get("accounts", []) if not (isinstance(a, dict) and a.get("alias") == alias)]
+        removed_config = len(cfg.get("accounts", [])) != before
+        save_config_unlocked(cfg)
+
+    deleted_profile = False
+    profile_error = None
+    listed = run_cmd([BIN, "--json", "list"], timeout=45)
+    profiles = parse_profiles_from_output(listed.stdout)
+    aliases = [p.get("alias") for p in profiles]
+    if alias in aliases:
+        current = next((p.get("alias") for p in profiles if p.get("alias") == alias and p.get("is_current")), None)
+        if current:
+            replacement = next((a for a in aliases if a and a != alias), None)
+            if replacement:
+                run_cmd([BIN, "--json", "use", replacement], timeout=30)
+        proc = run_cmd([BIN, "--json", "delete", alias], timeout=45)
+        if proc.returncode == 0:
+            deleted_profile = True
+        else:
+            profile_error = (proc.stderr or proc.stdout or f"delete failed with code {proc.returncode}")[-1000:]
+
+    return {
+        "ok": profile_error is None,
+        "alias": alias,
+        "removed_config": removed_config,
+        "deleted_profile": deleted_profile,
+        "profile_error": profile_error,
+        "accounts": get_expected_accounts(),
+    }
+
+
 def get_profiles(force: bool = False) -> dict:
     try:
         args = [BIN, "--json", "list"]
@@ -363,24 +409,25 @@ INDEX_HTML = r"""
     header { padding:28px 28px 16px; border-bottom:1px solid var(--line); background:rgba(0,0,0,.24); position:sticky; top:0; backdrop-filter: blur(10px); z-index:2; }
     h1 { margin:0 0 8px; font-size:28px; }
     .sub { color:var(--muted); }
-    main { padding:22px; max-width:1180px; margin:0 auto; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(310px,1fr)); gap:16px; }
-    .card { background:rgba(17,25,35,.94); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 30px rgba(0,0,0,.25); }
-    .row { display:flex; justify-content:space-between; gap:12px; align-items:center; }
-    .alias { font-size:20px; font-weight:800; }
-    .pill { padding:4px 9px; border-radius:999px; background:#1c2a38; color:var(--muted); font-size:12px; white-space:nowrap; }
+    main { padding:18px; max-width:none; width:100%; margin:0; }
+    .grid { display:flex; flex-wrap:nowrap; gap:12px; overflow-x:auto; overflow-y:hidden; padding:4px 4px 18px; scroll-snap-type:x proximity; }
+    .grid .card { flex:0 0 265px; min-width:265px; scroll-snap-align:start; }
+    .card { background:rgba(17,25,35,.94); border:1px solid var(--line); border-radius:16px; padding:14px; box-shadow:0 8px 30px rgba(0,0,0,.25); }
+    .row { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+    .alias { font-size:16px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:180px; }
+    .pill { padding:3px 7px; border-radius:999px; background:#1c2a38; color:var(--muted); font-size:11px; white-space:nowrap; }
     .ok { color:var(--green); } .warn { color:var(--yellow); } .bad { color:var(--red); }
-    .bar { height:12px; background:#0b1118; border-radius:999px; overflow:hidden; border:1px solid #243447; margin:8px 0 3px; }
+    .bar { height:9px; background:#0b1118; border-radius:999px; overflow:hidden; border:1px solid #243447; margin:6px 0 2px; }
     .fill { height:100%; width:0%; background:var(--green); transition:width .25s; }
     .fill.warn { background:var(--yellow); } .fill.bad { background:var(--red); }
-    button, a.btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; border:1px solid #2f4761; background:#16263a; color:var(--text); padding:10px 12px; border-radius:12px; cursor:pointer; text-decoration:none; font-weight:700; }
+    button, a.btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; border:1px solid #2f4761; background:#16263a; color:var(--text); padding:8px 10px; border-radius:10px; cursor:pointer; text-decoration:none; font-weight:700; font-size:13px; }
     button:hover, a.btn:hover { background:#1d3450; }
     .btn.primary { background:#14539a; border-color:#2e7ccc; }
-    .muted { color:var(--muted); font-size:13px; }
+    .muted { color:var(--muted); font-size:12px; }
     .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#05080c; border:1px solid var(--line); border-radius:10px; padding:9px; overflow:auto; }
-    input { width:100%; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:10px; padding:10px; margin-top:8px; }
+    input { width:100%; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:9px; padding:8px; margin-top:6px; font-size:13px; }
     pre { white-space:pre-wrap; max-height:220px; overflow:auto; }
-    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+    .actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
     .top-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
   </style>
 </head>
@@ -461,6 +508,12 @@ async function addAccount(){
   await refreshAll();
   window.location.href = `/auth/${encodeURIComponent(alias)}`;
 }
+async function removeAccount(alias, label){
+  if(!confirm(`Remove ${label || alias}? This removes the dashboard slot and deletes the saved local profile if it exists.`)) return;
+  const res = await api('/api/accounts/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias})});
+  if(!res.ok) alert(res.profile_error || res.error || 'Remove failed');
+  await refreshAll();
+}
 async function forceRefresh(){
   document.getElementById('scheduler').innerText = 'Force refresh running…';
   const res = await api('/api/refresh', {method:'POST'});
@@ -481,7 +534,7 @@ async function refreshAll(){
       <div class="actions"><button onclick="saveName('${escapeHtml(e.alias)}')">Save name</button></div>
       <p class="muted">Plan: ${escapeHtml(acct.plan||e.expected_plan||'unknown')} ${p?.is_current?'· current':''}</p>
       ${bar('5h', usage.primary)}${bar('7d / weekly', usage.secondary)}
-      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Add / re-auth</a><button onclick="refreshAll()">Refresh</button></div></article>`;
+      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Auth</a><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Remove</button></div></article>`;
   }).join('');
   renderAuthLinks();
 }
@@ -575,6 +628,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json_body()
                 acct = set_account_label(str(body.get("alias") or ""), str(body.get("label") or ""))
                 return self.send_json({"ok": True, "account": acct, "accounts": get_expected_accounts()})
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/accounts/remove":
+            try:
+                body = self.read_json_body()
+                result = remove_account(str(body.get("alias") or ""))
+                return self.send_json(result, 200 if result.get("ok") else 400)
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
         if parsed.path == "/api/refresh":
