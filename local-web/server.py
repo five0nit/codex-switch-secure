@@ -3,6 +3,7 @@
 
 Binds to 127.0.0.1 only. It never displays OAuth tokens. Auth onboarding uses
 OpenAI's device-code flow through the reviewed local codex-switch-secure binary.
+Includes editable display names and a Melbourne-business-hours force refresher.
 """
 from __future__ import annotations
 
@@ -13,22 +14,41 @@ import re
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+from zoneinfo import ZoneInfo
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("CODEX_SWITCH_WEB_PORT", "8787"))
 BIN = os.environ.get("CODEX_SWITCH_BIN", str(Path.home() / ".local/bin/codex-switch-secure"))
+CONFIG_PATH = Path(os.environ.get("CODEX_SWITCH_WEB_CONFIG", str(Path.home() / ".codex-switch/local-web-config.json")))
+MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
+REFRESH_INTERVAL_SECONDS = 30 * 60
+DEVICE_URL_FALLBACK = "https://auth.openai.com/codex/device"
 DEFAULT_ACCOUNTS = [
     {"alias": "pro-1", "label": "Pro account 1", "expected_plan": "pro"},
     {"alias": "pro-2", "label": "Pro account 2", "expected_plan": "pro"},
     {"alias": "business-seat", "label": "Business seat", "expected_plan": "business"},
 ]
-DEVICE_URL_FALLBACK = "https://auth.openai.com/codex/device"
 
 sessions: dict[str, "LoginSession"] = {}
 sessions_lock = threading.Lock()
+config_lock = threading.Lock()
+refresh_lock = threading.Lock()
+refresh_state: dict = {
+    "enabled": True,
+    "timezone": "Australia/Melbourne",
+    "window": "Mon-Fri 07:00-18:00",
+    "interval_seconds": REFRESH_INTERVAL_SECONDS,
+    "last_run_at": None,
+    "last_success_at": None,
+    "last_error": None,
+    "last_profile_count": None,
+    "next_run_at": None,
+    "running": False,
+}
 
 
 def run_cmd(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -47,15 +67,178 @@ def json_from_mixed_stdout(stdout: str):
     return None
 
 
-def get_profiles() -> dict:
+def _default_config() -> dict:
+    return {"accounts": DEFAULT_ACCOUNTS}
+
+
+def load_config() -> dict:
+    with config_lock:
+        if not CONFIG_PATH.exists():
+            cfg = _default_config()
+            save_config_unlocked(cfg)
+            return cfg
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            cfg = _default_config()
+        accounts = cfg.get("accounts") if isinstance(cfg, dict) else None
+        if not isinstance(accounts, list):
+            cfg = _default_config()
+        by_alias = {a.get("alias"): a for a in cfg.get("accounts", []) if isinstance(a, dict)}
+        changed = False
+        for acct in DEFAULT_ACCOUNTS:
+            if acct["alias"] not in by_alias:
+                cfg.setdefault("accounts", []).append(acct.copy())
+                changed = True
+        if changed:
+            save_config_unlocked(cfg)
+        return cfg
+
+
+def save_config_unlocked(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(CONFIG_PATH)
+
+
+def save_config(cfg: dict) -> None:
+    with config_lock:
+        save_config_unlocked(cfg)
+
+
+def get_expected_accounts() -> list[dict]:
+    cfg = load_config()
+    accounts = []
+    for acct in cfg.get("accounts", []):
+        if not isinstance(acct, dict):
+            continue
+        alias = str(acct.get("alias", ""))
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+            continue
+        accounts.append({
+            "alias": alias,
+            "label": str(acct.get("label") or alias)[:120],
+            "expected_plan": str(acct.get("expected_plan") or "")[:80],
+        })
+    return accounts or DEFAULT_ACCOUNTS.copy()
+
+
+def set_account_label(alias: str, label: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+        raise ValueError("invalid alias")
+    label = label.strip()[:120]
+    if not label:
+        raise ValueError("display name cannot be empty")
+    with config_lock:
+        cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else _default_config()
+        accounts = cfg.setdefault("accounts", [])
+        for acct in accounts:
+            if acct.get("alias") == alias:
+                acct["label"] = label
+                save_config_unlocked(cfg)
+                return acct
+        acct = {"alias": alias, "label": label, "expected_plan": ""}
+        accounts.append(acct)
+        save_config_unlocked(cfg)
+        return acct
+
+
+def get_profiles(force: bool = False) -> dict:
     try:
-        proc = run_cmd([BIN, "--json", "list"], timeout=45)
+        args = [BIN, "--json", "list"]
+        if force:
+            args.append("--force")
+        proc = run_cmd(args, timeout=75 if force else 45)
         parsed = json_from_mixed_stdout(proc.stdout)
         if parsed is None:
             return {"ok": False, "error": (proc.stderr or proc.stdout or "No JSON output")[-2000:]}
+        parsed["accounts_config"] = get_expected_accounts()
+        parsed["refresh_state"] = get_refresh_state()
         return {"ok": True, **parsed}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "accounts_config": get_expected_accounts(), "refresh_state": get_refresh_state()}
+
+
+def is_business_slot(dt: datetime) -> bool:
+    # Monday=0, Friday=4. Run on half-hour slots 07:00 through 18:00 inclusive.
+    return dt.weekday() < 5 and ((dt.hour > 7 or (dt.hour == 7 and dt.minute >= 0)) and (dt.hour < 18 or (dt.hour == 18 and dt.minute == 0)))
+
+
+def ceil_to_half_hour(dt: datetime) -> datetime:
+    base = dt.replace(second=0, microsecond=0)
+    if dt.second or dt.microsecond:
+        base += timedelta(minutes=1)
+    minute = 0 if base.minute <= 0 else 30 if base.minute <= 30 else 60
+    if minute == 60:
+        return (base + timedelta(hours=1)).replace(minute=0)
+    return base.replace(minute=minute)
+
+
+def next_refresh_slot(now: datetime | None = None) -> datetime:
+    now = now or datetime.now(MELBOURNE_TZ)
+    candidate = ceil_to_half_hour(now)
+    if candidate <= now:
+        candidate += timedelta(minutes=30)
+    for _ in range(16 * 24 * 2):
+        if is_business_slot(candidate):
+            return candidate
+        # Jump efficiently outside the business window.
+        if candidate.weekday() >= 5 or candidate.hour > 18 or (candidate.hour == 18 and candidate.minute > 0):
+            candidate = (candidate + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
+        elif candidate.hour < 7:
+            candidate = candidate.replace(hour=7, minute=0, second=0, microsecond=0)
+        else:
+            candidate += timedelta(minutes=30)
+    return candidate
+
+
+def iso(dt: datetime | None) -> str | None:
+    return dt.isoformat() if dt else None
+
+
+def get_refresh_state() -> dict:
+    with refresh_lock:
+        state = dict(refresh_state)
+    return state
+
+
+def force_refresh(reason: str = "manual") -> dict:
+    with refresh_lock:
+        if refresh_state.get("running"):
+            return {"ok": False, "error": "refresh already running", **dict(refresh_state)}
+        refresh_state["running"] = True
+        refresh_state["last_run_at"] = iso(datetime.now(MELBOURNE_TZ))
+        refresh_state["last_error"] = None
+    try:
+        data = get_profiles(force=True)
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error") or "refresh failed")
+        with refresh_lock:
+            refresh_state["running"] = False
+            refresh_state["last_success_at"] = iso(datetime.now(MELBOURNE_TZ))
+            refresh_state["last_profile_count"] = len(data.get("profiles", []))
+            refresh_state["last_reason"] = reason
+        return {"ok": True, "profile_count": len(data.get("profiles", [])), "reason": reason, "refresh_state": get_refresh_state()}
+    except Exception as exc:
+        with refresh_lock:
+            refresh_state["running"] = False
+            refresh_state["last_error"] = str(exc)
+        return {"ok": False, "error": str(exc), "refresh_state": get_refresh_state()}
+
+
+def scheduler_loop() -> None:
+    while True:
+        nxt = next_refresh_slot()
+        with refresh_lock:
+            refresh_state["next_run_at"] = iso(nxt)
+        while True:
+            diff = (nxt - datetime.now(MELBOURNE_TZ)).total_seconds()
+            if diff <= 0:
+                break
+            time.sleep(min(60, max(1, diff)))
+        force_refresh("scheduled")
 
 
 class LoginSession:
@@ -97,7 +280,6 @@ class LoginSession:
                         self.verification_uri = line.split("To sign in, visit:", 1)[1].strip()
                     if "Enter code:" in line:
                         self.user_code = line.split("Enter code:", 1)[1].strip()
-                    # Defensive generic URL/code parsing if output text changes slightly.
                     if not self.verification_uri:
                         m = re.search(r"https://auth\.openai\.com/\S+", line)
                         if m:
@@ -182,7 +364,7 @@ INDEX_HTML = r"""
     h1 { margin:0 0 8px; font-size:28px; }
     .sub { color:var(--muted); }
     main { padding:22px; max-width:1180px; margin:0 auto; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(290px,1fr)); gap:16px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(310px,1fr)); gap:16px; }
     .card { background:rgba(17,25,35,.94); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 30px rgba(0,0,0,.25); }
     .row { display:flex; justify-content:space-between; gap:12px; align-items:center; }
     .alias { font-size:20px; font-weight:800; }
@@ -196,6 +378,7 @@ INDEX_HTML = r"""
     .btn.primary { background:#14539a; border-color:#2e7ccc; }
     .muted { color:var(--muted); font-size:13px; }
     .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#05080c; border:1px solid var(--line); border-radius:10px; padding:9px; overflow:auto; }
+    input { width:100%; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:10px; padding:10px; margin-top:8px; }
     pre { white-space:pre-wrap; max-height:220px; overflow:auto; }
     .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
     .top-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
@@ -207,10 +390,15 @@ INDEX_HTML = r"""
   <div class="sub">Local-only dashboard. Auth uses device-code flow; OAuth tokens are never shown here.</div>
   <div class="top-actions">
     <button onclick="refreshAll()">Refresh usage</button>
+    <button onclick="forceRefresh()">Force refresh now</button>
     <a class="btn" href="/api/accounts" target="_blank">Raw JSON</a>
   </div>
 </header>
 <main>
+  <section class="card" style="margin-bottom:18px">
+    <div class="alias">Auto refresher</div>
+    <div class="muted" id="scheduler">Loading…</div>
+  </section>
   <section class="grid" id="cards"></section>
   <section class="card" style="margin-top:18px">
     <div class="alias">Auth setup links</div>
@@ -219,7 +407,8 @@ INDEX_HTML = r"""
   </section>
 </main>
 <script>
-const expected = __ACCOUNTS__;
+let expected = [];
+function escapeHtml(s){ return String(s||'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
 function pct(n){ return Math.max(0, Math.min(100, Number(n||0))); }
 function bar(label, win){
   if(!win) return `<div class="muted">${label}: no data</div>`;
@@ -227,24 +416,49 @@ function bar(label, win){
   return `<div><div class="row"><span>${label}</span><span class="${cls}">${p.toFixed(1)}% used · ${(100-p).toFixed(1)}% left</span></div><div class="bar"><div class="fill ${cls}" style="width:${p}%"></div></div><div class="muted">resets in ${Math.max(0, Math.round((win.resets_in_seconds||0)/3600))}h</div></div>`;
 }
 async function api(path, opts){ const r=await fetch(path, opts); return await r.json(); }
+function renderScheduler(state){
+  state = state || {};
+  const bits = [`Every 30 min`, `Mon-Fri`, `07:00-18:00`, `Australia/Melbourne`];
+  if(state.running) bits.push('running now');
+  if(state.next_run_at) bits.push(`next: ${new Date(state.next_run_at).toLocaleString()}`);
+  if(state.last_success_at) bits.push(`last success: ${new Date(state.last_success_at).toLocaleString()}`);
+  if(state.last_error) bits.push(`last error: ${state.last_error}`);
+  document.getElementById('scheduler').innerText = bits.join(' · ');
+}
+async function saveName(alias){
+  const label = document.getElementById(`name-${alias}`).value;
+  const res = await api('/api/accounts/name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias,label})});
+  if(!res.ok) alert(res.error || 'Save failed');
+  await refreshAll();
+}
+async function forceRefresh(){
+  document.getElementById('scheduler').innerText = 'Force refresh running…';
+  const res = await api('/api/refresh', {method:'POST'});
+  if(!res.ok) alert(res.error || 'Refresh failed');
+  await refreshAll();
+}
 async function refreshAll(){
   const data = await api('/api/accounts');
+  expected = data.accounts_config || expected || [];
+  renderScheduler(data.refresh_state);
   const profiles = data.profiles || [];
   const byAlias = Object.fromEntries(profiles.map(p=>[p.alias,p]));
   const merged = [...expected.map(e=>({expected:e, profile:byAlias[e.alias]})), ...profiles.filter(p=>!expected.find(e=>e.alias===p.alias)).map(p=>({expected:{alias:p.alias,label:p.alias,expected_plan:''}, profile:p}))];
   document.getElementById('cards').innerHTML = merged.map(({expected:e, profile:p})=>{
     const usage=p?.usage||{}; const acct=p?.account||{}; const status=p?'Connected':'Not connected';
-    return `<article class="card"><div class="row"><div><div class="alias">${e.label}</div><div class="muted">alias: ${e.alias}</div></div><span class="pill ${p?'ok':'warn'}">${status}</span></div>
-      <p class="muted">Plan: ${acct.plan||e.expected_plan||'unknown'} ${p?.is_current?'· current':''}</p>
+    return `<article class="card"><div class="row"><div><div class="alias">${escapeHtml(e.label)}</div><div class="muted">alias: ${escapeHtml(e.alias)}</div></div><span class="pill ${p?'ok':'warn'}">${status}</span></div>
+      <label class="muted">Display name</label><input id="name-${escapeHtml(e.alias)}" value="${escapeHtml(e.label)}" maxlength="120" />
+      <div class="actions"><button onclick="saveName('${escapeHtml(e.alias)}')">Save name</button></div>
+      <p class="muted">Plan: ${escapeHtml(acct.plan||e.expected_plan||'unknown')} ${p?.is_current?'· current':''}</p>
       ${bar('5h', usage.primary)}${bar('7d / weekly', usage.secondary)}
-      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Add / re-auth</a><button onclick="refreshOne('${e.alias}')">Refresh</button></div></article>`;
+      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Add / re-auth</a><button onclick="refreshAll()">Refresh</button></div></article>`;
   }).join('');
+  renderAuthLinks();
 }
-async function refreshOne(alias){ await refreshAll(); }
 function renderAuthLinks(){
-  document.getElementById('authLinks').innerHTML = expected.map(e=>`<a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Authorize ${e.label}</a>`).join('');
+  document.getElementById('authLinks').innerHTML = expected.map(e=>`<a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Authorize ${escapeHtml(e.label)}</a>`).join('');
 }
-renderAuthLinks(); refreshAll(); setInterval(refreshAll, 15000);
+refreshAll(); setInterval(refreshAll, 15000);
 </script>
 </body>
 </html>
@@ -273,10 +487,9 @@ fetch(`/api/login/start?alias=${encodeURIComponent(alias)}`, {method:'POST'}).th
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CodexSwitchLocalWeb/0.1"
+    server_version = "CodexSwitchLocalWeb/0.2"
 
     def log_message(self, format, *args):
-        # Avoid noisy request logs; no tokens should be present, but keep logs quiet.
         return
 
     def _send(self, status: int, body: bytes, content_type: str):
@@ -286,6 +499,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or "0")
+        if length <= 0:
+            return {}
+        return json.loads(self.rfile.read(length).decode())
+
     def send_json(self, obj, status=200):
         self._send(status, json.dumps(obj, indent=2).encode(), "application/json; charset=utf-8")
 
@@ -293,16 +512,17 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/":
-            body = INDEX_HTML.replace("__ACCOUNTS__", json.dumps(DEFAULT_ACCOUNTS)).encode()
-            return self._send(200, body, "text/html; charset=utf-8")
+            return self._send(200, INDEX_HTML.encode(), "text/html; charset=utf-8")
         if path == "/api/accounts":
             return self.send_json(get_profiles())
+        if path == "/api/config":
+            return self.send_json({"ok": True, "accounts": get_expected_accounts(), "refresh_state": get_refresh_state()})
         if path == "/api/login/status":
             alias = parse_qs(parsed.query).get("alias", [""])[0]
             sess = get_session(alias)
             return self.send_json(sess.status() if sess else {"alias": alias, "ready": False, "done": False, "lines": []})
         if path.startswith("/auth/"):
-            alias = path.rsplit("/", 1)[-1]
+            alias = unquote(path.rsplit("/", 1)[-1])
             alias = re.sub(r"[^A-Za-z0-9._-]", "", alias)[:64]
             body = AUTH_HTML.replace("__ALIAS__", html.escape(alias)).encode()
             return self._send(200, body, "text/html; charset=utf-8")
@@ -320,17 +540,29 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/login/cancel":
             alias = parse_qs(parsed.query).get("alias", [""])[0]
             return self.send_json({"cancelled": cancel_session(alias)})
+        if parsed.path == "/api/accounts/name":
+            try:
+                body = self.read_json_body()
+                acct = set_account_label(str(body.get("alias") or ""), str(body.get("label") or ""))
+                return self.send_json({"ok": True, "account": acct, "accounts": get_expected_accounts()})
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/refresh":
+            return self.send_json(force_refresh("manual"))
         return self.send_json({"error": "not found"}, 404)
 
 
 def main():
     if not Path(BIN).exists():
         raise SystemExit(f"codex-switch binary not found: {BIN}")
+    load_config()
+    threading.Thread(target=scheduler_loop, name="melbourne-refresh-scheduler", daemon=True).start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Codex Switch local web UI: http://{HOST}:{PORT}", flush=True)
-    print(f"Auth links:", flush=True)
-    for acct in DEFAULT_ACCOUNTS:
+    print("Auth links:", flush=True)
+    for acct in get_expected_accounts():
         print(f"  {acct['label']}: http://{HOST}:{PORT}/auth/{acct['alias']}", flush=True)
+    print("Auto refresh: every 30 min, Mon-Fri 07:00-18:00 Australia/Melbourne", flush=True)
     httpd.serve_forever()
 
 
