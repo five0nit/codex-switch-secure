@@ -63,6 +63,23 @@ Manual refresh is also available from the dashboard button, and programmatically
 curl -X POST http://localhost:8787/api/refresh
 ```
 
+## Adding more accounts
+
+Use the **Add account** card in the dashboard:
+
+1. Enter a display name.
+2. Optionally enter an internal alias, e.g. `spare-pro-1`.
+3. Click **Add account**.
+4. The dashboard opens that account's auth page and starts the same OpenAI device-code flow.
+
+You can also add/update an account slot programmatically with:
+
+```bash
+curl -X POST http://localhost:8787/api/accounts/name \
+  -H 'Content-Type: application/json' \
+  -d '{"alias":"spare-pro-1","label":"Spare Pro 1"}'
+```
+
 Scheduler state is visible in the dashboard and in:
 
 ```text

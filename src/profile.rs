@@ -507,6 +507,29 @@ pub fn auto_track_current() -> bool {
         return false;
     }
 
+    // Some Codex auth files do not expose account_id or email in the token payload.
+    // In that case identity matching cannot work; avoid creating account_N duplicates
+    // forever by falling back to exact auth.json value equality against saved profiles.
+    if identity.account_id.is_none()
+        && identity.email.is_none()
+        && let Ok(profiles) = list_profiles()
+    {
+        for alias in profiles {
+            let Ok(path) = profile_auth_path(&alias) else {
+                continue;
+            };
+            let Ok(existing) = read_auth(&path) else {
+                continue;
+            };
+            if existing == val {
+                if let Err(e) = write_current(&alias) {
+                    tracing::debug!("auto_track_current: could not sync current pointer by auth value: {e}");
+                }
+                return false;
+            }
+        }
+    }
+
     if let Ok(SaveAction::Created(a)) = cmd_save(None) {
         user_println(&format!("Auto-saved current account as profile: {a}"));
         return true;

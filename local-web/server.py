@@ -399,6 +399,16 @@ INDEX_HTML = r"""
     <div class="alias">Auto refresher</div>
     <div class="muted" id="scheduler">Loading…</div>
   </section>
+  <section class="card" style="margin-bottom:18px">
+    <div class="alias">Add account</div>
+    <p class="muted">Create a new dashboard slot and immediately start device-code auth. Alias is internal; display name is what you see on cards.</p>
+    <div class="row" style="align-items:flex-end; flex-wrap:wrap">
+      <label style="flex:1; min-width:220px"><span class="muted">Display name</span><input id="newLabel" placeholder="e.g. Spare Pro account" maxlength="120" /></label>
+      <label style="flex:1; min-width:180px"><span class="muted">Alias</span><input id="newAlias" placeholder="e.g. spare-pro" maxlength="64" /></label>
+      <button class="btn primary" onclick="addAccount()">Add account</button>
+    </div>
+    <div class="muted" id="addAccountStatus"></div>
+  </section>
   <section class="grid" id="cards"></section>
   <section class="card" style="margin-top:18px">
     <div class="alias">Auth setup links</div>
@@ -430,6 +440,26 @@ async function saveName(alias){
   const res = await api('/api/accounts/name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias,label})});
   if(!res.ok) alert(res.error || 'Save failed');
   await refreshAll();
+}
+function slugifyAlias(label){
+  return String(label||'').toLowerCase().replace(/[^a-z0-9._-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,64);
+}
+async function addAccount(){
+  const labelEl = document.getElementById('newLabel');
+  const aliasEl = document.getElementById('newAlias');
+  const statusEl = document.getElementById('addAccountStatus');
+  const label = labelEl.value.trim();
+  let alias = aliasEl.value.trim() || slugifyAlias(label);
+  if(!label){ alert('Enter a display name first.'); return; }
+  if(!alias){ alert('Enter an alias.'); return; }
+  if(!/^[A-Za-z0-9._-]{1,64}$/.test(alias)){ alert('Alias can only use letters, numbers, dot, underscore, and dash.'); return; }
+  statusEl.innerText = `Adding ${label}…`;
+  const res = await api('/api/accounts/name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias,label})});
+  if(!res.ok){ alert(res.error || 'Add failed'); statusEl.innerText = ''; return; }
+  labelEl.value = ''; aliasEl.value = '';
+  statusEl.innerText = `Added ${label}. Opening auth page…`;
+  await refreshAll();
+  window.location.href = `/auth/${encodeURIComponent(alias)}`;
 }
 async function forceRefresh(){
   document.getElementById('scheduler').innerText = 'Force refresh running…';
