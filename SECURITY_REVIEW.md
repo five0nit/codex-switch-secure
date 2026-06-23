@@ -37,7 +37,9 @@ This tool handles Codex/OpenAI OAuth credentials (`auth.json`) and calls ChatGPT
 
 - Added `auth::allow_insecure_endpoint_overrides()`.
 - `CS_TOKEN_URL`, `CS_USAGE_URL`, and `CS_GITHUB_API_URL` are ignored unless `CS_ALLOW_INSECURE_ENDPOINT_OVERRIDES=1` is set explicitly.
-- Retargeted self-update release lookup from upstream to `five0nit/codex-switch-secure`, so our hardened binary will not auto-replace itself from upstream releases.
+- Disabled runtime self-update and update checks. This credential-handling tool should be updated only by pulling, reviewing, testing, and rebuilding from this private fork.
+- Disabled the release-publishing workflow in this private fork.
+- Added CI for tests, clippy, and `cargo audit`.
 - Updated the integration test harness to opt into endpoint overrides only for local mock-server tests.
 
 ## Verification run
@@ -50,9 +52,9 @@ This tool handles Codex/OpenAI OAuth credentials (`auth.json`) and calls ChatGPT
 
 ## Remaining recommended work before real OAuth accounts
 
-1. Add CI in the private fork for test/clippy/audit.
-2. Consider disabling `self-update` entirely or requiring signed releases before distributing binaries.
-3. Run the tool first with throwaway/test Codex auth only.
+1. Run the tool first with throwaway/test Codex auth only.
+2. Use local source builds from this private repo; do not use upstream install scripts.
+3. Review OAuth/login/account-switch flows again before importing Mike's real account pool.
 
 ## Operational policy
 

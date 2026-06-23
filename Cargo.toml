@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Codex account switcher — multi-profile manager with usage dashboard"
 license = "MIT"
-repository = "https://github.com/xjoker/codex-switch"
+repository = "https://github.com/five0nit/codex-switch-secure"
 keywords = ["codex", "openai", "account", "switcher", "cli"]
 categories = ["command-line-utilities"]
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -69,132 +71,36 @@ struct GithubAsset {
 }
 
 pub async fn check_for_update(force: bool) -> Result<Option<UpdateInfo>> {
-    let current_version = current_version().to_string();
-    let latest_version = latest_release_version(force).await?;
-    if !is_newer_version(&latest_version, &current_version) {
-        return Ok(None);
-    }
-
-    Ok(Some(UpdateInfo {
-        current_version,
-        latest_version,
-        install_source: detect_install_source(),
-    }))
+    let _ = force;
+    // Mike's private fork intentionally disables runtime update checks.
+    // This binary handles OAuth credentials, so updates should be reviewed,
+    // tested, and rebuilt from source in the private repository instead of
+    // discovered or applied at runtime.
+    Ok(None)
 }
 
 /// Check whether a newer dev release exists on GitHub.
 ///
-/// Dev versions include a build timestamp (e.g. `0.0.11-dev.20260408143000`)
-/// so each build is unique and semver-comparable.
+/// Disabled in Mike's private fork; see `check_for_update` for rationale.
 pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
-    let current_version = current_version().to_string();
-    let release = match fetch_release_optional(Some("dev"))
-        .await
-        .context("checking dev release")?
-    {
-        Some(r) => r,
-        None => return Ok(None), // No dev release exists (404).
-    };
-    let dev_version = extract_release_version(&release);
-    if !is_newer_version(&dev_version, &current_version) {
-        return Ok(None);
-    }
-    Ok(Some(UpdateInfo {
-        current_version,
-        latest_version: dev_version,
-        install_source: detect_install_source(),
-    }))
+    Ok(None)
 }
 
 pub async fn self_update(version: Option<&str>, show_progress: bool) -> Result<SelfUpdateResult> {
-    let install_source = detect_install_source();
-    if install_source == InstallSource::Homebrew {
-        anyhow::bail!(
-            "Homebrew-managed install detected. Run `{}` instead.",
-            install_source.upgrade_hint()
-        );
-    }
-
-    let current_version = current_version().to_string();
-    let release = fetch_release(version).await?;
-    let latest_version = extract_release_version(&release);
-
-    if let Some(requested) = version {
-        let requested = normalize_version(requested);
-        if requested != latest_version {
-            anyhow::bail!("requested version '{requested}' was not found on GitHub Releases");
-        }
-        if is_older_version(&latest_version, &current_version) {
-            anyhow::bail!(
-                "downgrades are not supported: requested version {latest_version} is older than current version {current_version}"
-            );
-        }
-        if latest_version == current_version {
-            return Ok(SelfUpdateResult {
-                current_version,
-                latest_version,
-                install_source,
-                updated: false,
-            });
-        }
-    } else if !is_newer_version(&latest_version, &current_version) {
-        return Ok(SelfUpdateResult {
-            current_version,
-            latest_version,
-            install_source,
-            updated: false,
-        });
-    }
-
-    download_and_replace(&release, show_progress, "").await?;
-
-    save_update_cache(&UpdateCache {
-        checked_at: crate::auth::now_unix_secs(),
-        latest_version: latest_version.clone(),
-    });
-
-    Ok(SelfUpdateResult {
-        current_version,
-        latest_version,
-        install_source,
-        updated: true,
-    })
+    let _ = (version, show_progress);
+    anyhow::bail!(
+        "self-update is disabled in Mike's private security fork; update by pulling, reviewing, testing, and rebuilding from five0nit/codex-switch-secure"
+    )
 }
 
 /// Install the dev build from the `dev` GitHub Release tag.
 ///
-/// Switching from dev→stable uses the normal `self_update` path.
+/// Disabled in Mike's private fork; see `self_update` for rationale.
 pub async fn self_update_dev(show_progress: bool) -> Result<SelfUpdateResult> {
-    let install_source = detect_install_source();
-    if install_source == InstallSource::Homebrew {
-        anyhow::bail!(
-            "codex-switch is installed via Homebrew. Please run `brew uninstall codex-switch` first, then use the install script or `self-update --dev` again."
-        );
-    }
-
-    let current_version = current_version().to_string();
-    let release = fetch_release(Some("dev"))
-        .await
-        .context("fetching dev release from GitHub")?;
-    let dev_version = extract_release_version(&release);
-
-    if !is_newer_version(&dev_version, &current_version) {
-        return Ok(SelfUpdateResult {
-            current_version,
-            latest_version: dev_version,
-            install_source,
-            updated: false,
-        });
-    }
-
-    download_and_replace(&release, show_progress, " (dev)").await?;
-
-    Ok(SelfUpdateResult {
-        current_version,
-        latest_version: dev_version,
-        install_source,
-        updated: true,
-    })
+    let _ = show_progress;
+    anyhow::bail!(
+        "self-update is disabled in Mike's private security fork; update by pulling, reviewing, testing, and rebuilding from five0nit/codex-switch-secure"
+    )
 }
 
 /// Extract a semver-compatible version string from a GitHub Release.

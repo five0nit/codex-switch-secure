@@ -32,9 +32,9 @@ pub enum DaemonCommand {
 #[command(
     name = "codex-switch",
     version = concat!(env!("CARGO_PKG_VERSION"), "\n", env!("CARGO_PKG_REPOSITORY")),
-    about = "Codex account switcher -- multi-profile manager with usage dashboard\nhttps://github.com/xjoker/codex-switch",
+    about = "Codex account switcher -- multi-profile manager with usage dashboard\nhttps://github.com/five0nit/codex-switch-secure",
     long_about = None,
-    after_help = "Examples:\n  codex-switch list\n  codex-switch use\n  codex-switch rename old-alias new-alias\n  codex-switch import ./auth-backups\n  codex-switch self-update --check\n\nRun `codex-switch <command> --help` for command-specific options."
+    after_help = "Examples:\n  codex-switch list\n  codex-switch use\n  codex-switch rename old-alias new-alias\n  codex-switch import ./auth-backups\n\nRun `codex-switch <command> --help` for command-specific options.\n\nSecurity fork note: runtime self-update is disabled; update from reviewed source builds only."
 )]
 pub struct Cli {
     /// Output as compact JSON (supported by list, use, rename, delete, login, import, self-update)
