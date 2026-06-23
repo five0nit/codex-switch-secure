@@ -31,7 +31,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v3
+        uses: Swatinem/rust-cache@v2
 
       - name: Run tests
         run: cargo test --locked
