@@ -76,6 +76,8 @@ Use the **Add account** card in the dashboard:
 3. Click **Add account**.
 4. The dashboard opens that account's auth page and starts the same OpenAI device-code flow.
 
+Device codes are valid for roughly 15 minutes. If a code fails or expires, the auth page now shows **Start a fresh auth code**; use that instead of trying to reuse the old code.
+
 You can also add/update an account slot programmatically with:
 
 ```bash

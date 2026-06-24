@@ -423,8 +423,16 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
             let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("");
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
 
+            let msg_lower = msg.to_ascii_lowercase();
             match code {
                 "deviceauth_authorization_unknown" | "authorization_pending" => continue,
+                // OpenAI sometimes returns the still-pending state as a generic
+                // error object with only a human message and no stable code.
+                // Treat that exactly like authorization_pending instead of
+                // aborting the device flow after the first poll.
+                _ if msg_lower.contains("authorization is pending")
+                    || msg_lower.contains("authorization pending")
+                    || msg_lower.contains("please try again") => continue,
                 "slow_down" => {
                     interval_secs = interval_secs.saturating_add(5);
                     continue;

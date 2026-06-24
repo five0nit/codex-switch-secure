@@ -389,10 +389,14 @@ def get_session(alias: str) -> LoginSession | None:
 def cancel_session(alias: str) -> bool:
     with sessions_lock:
         sess = sessions.pop(alias, None)
-    if sess:
-        sess.cancel()
-        return True
-    return False
+    if not sess:
+        return False
+    sess.cancel()
+    with sess._lock:
+        sess.done = True
+        sess.returncode = -1
+        sess.error = "cancelled"
+    return True
 
 
 INDEX_HTML = r"""
@@ -559,10 +563,16 @@ async function poll(){
  if(s.ready){ html+=`<p>1. Open OpenAI device page:</p><p><a target="_blank" href="${s.verification_uri}">Open auth page</a></p><p>2. Enter this code:</p><div class="code">${s.user_code}</div>`; }
  else { html+=`<p>Requesting code…</p>`; }
  if(s.done && s.returncode===0){ html+=`<h2 style="color:#41d17d">Done — account saved.</h2><p><a href="/">Return to dashboard</a></p>`; }
+ if(s.done && s.returncode!==0){ html+=`<p><button onclick="restartAuth()">Start a fresh auth code</button></p><p class="muted">Codes are single-use. If the old code failed, start a fresh one and use it within ~15 minutes.</p>`; }
  if(s.error){ html+=`<h2 style="color:#ff5d5d">Error</h2><p>${s.error}</p>`; }
  html+=`<h3>Log</h3><pre>${(s.lines||[]).map(x=>x.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))).join('\n')}</pre>`;
  document.getElementById('content').innerHTML=html;
  if(!s.done) setTimeout(poll,2000);
+}
+async function restartAuth(){
+ await fetch(`/api/login/cancel?alias=${encodeURIComponent(alias)}`, {method:'POST'});
+ await fetch(`/api/login/start?alias=${encodeURIComponent(alias)}`, {method:'POST'});
+ poll();
 }
 fetch(`/api/login/start?alias=${encodeURIComponent(alias)}`, {method:'POST'}).then(poll);
 </script></body></html>
