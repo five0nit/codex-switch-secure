@@ -8,7 +8,9 @@ Includes editable display names and a Melbourne-business-hours force refresher.
 from __future__ import annotations
 
 import base64
+import csv
 import html
+import io
 import json
 import os
 import re
@@ -22,6 +24,7 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 HOST = "127.0.0.1"
@@ -30,6 +33,7 @@ BIN = os.environ.get("CODEX_SWITCH_BIN", str(Path.home() / ".local/bin/codex-swi
 CONFIG_PATH = Path(os.environ.get("CODEX_SWITCH_WEB_CONFIG", str(Path.home() / ".codex-switch/local-web-config.json")))
 PROFILE_ROOT = Path(os.environ.get("CODEX_SWITCH_PROFILE_ROOT", str(Path.home() / ".codex-switch/profiles")))
 SHARE_DIR = Path(os.environ.get("CODEX_SWITCH_SHARE_DIR", str(Path.home() / ".codex-switch/share")))
+MACHINE_USAGE_CACHE = Path(os.environ.get("CODEX_SWITCH_MACHINE_USAGE_CACHE", str(Path.home() / ".codex-switch/machine-usage-cache.json")))
 MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
 REFRESH_INTERVAL_SECONDS = 30 * 60
 DEVICE_URL_FALLBACK = "https://auth.openai.com/codex/device"
@@ -75,7 +79,7 @@ def json_from_mixed_stdout(stdout: str):
 
 
 def _default_config() -> dict:
-    return {"accounts": DEFAULT_ACCOUNTS}
+    return {"accounts": DEFAULT_ACCOUNTS, "machine_usage_sheet_csv_url": ""}
 
 
 def load_config() -> dict:
@@ -218,6 +222,121 @@ def build_share_auth(alias: str) -> dict:
         "target_machine_payload_install_command": payload_cmd,
         "target_machine_import_command_note": f"If you copy {bundle_path.name} to another machine, import it there with: {q_bin} import /path/to/{shlex.quote(bundle_path.name)} {q_alias}",
     }
+
+
+def get_machine_usage_source() -> str:
+    cfg = load_config()
+    return str(cfg.get("machine_usage_sheet_csv_url") or os.environ.get("CODEX_SWITCH_MACHINE_USAGE_SHEET_CSV_URL") or "").strip()
+
+
+def set_machine_usage_source(url: str) -> dict:
+    url = str(url or "").strip()
+    if url and not (url.startswith("https://") or url.startswith("http://")):
+        raise ValueError("sheet CSV URL must start with http:// or https://")
+    with config_lock:
+        cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else _default_config()
+        cfg["machine_usage_sheet_csv_url"] = url
+        save_config_unlocked(cfg)
+    return {"ok": True, "machine_usage_sheet_csv_url": url}
+
+
+def _intish(value) -> int:
+    try:
+        return int(float(str(value or "0").replace(",", "").strip() or "0"))
+    except Exception:
+        return 0
+
+
+def _row_value(row: dict, *names: str) -> str:
+    lower = {str(k).strip().lower(): v for k, v in row.items()}
+    for name in names:
+        if name.lower() in lower:
+            return str(lower[name.lower()] or "").strip()
+    return ""
+
+
+def _parse_iso_ts(value: str) -> datetime | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        cleaned = value[:-1] + "+00:00" if value.endswith("Z") else value
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MELBOURNE_TZ)
+        return dt
+    except Exception:
+        return None
+
+
+def get_machine_usage(force: bool = False) -> dict:
+    source = get_machine_usage_source()
+    now = datetime.now(MELBOURNE_TZ)
+    if not source:
+        return {"ok": True, "configured": False, "source": "google_sheet_csv", "rows": [], "totals": {"tokens_24h": 0, "tokens_7d": 0}, "message": "Set a published Google Sheet CSV URL first."}
+
+    if not force and MACHINE_USAGE_CACHE.exists():
+        try:
+            cached = json.loads(MACHINE_USAGE_CACHE.read_text())
+            fetched_at = _parse_iso_ts(cached.get("fetched_at"))
+            if fetched_at and (now - fetched_at).total_seconds() < REFRESH_INTERVAL_SECONDS:
+                cached["cache_hit"] = True
+                return cached
+        except Exception:
+            pass
+
+    req = Request(source, headers={"User-Agent": "codex-switch-local-dashboard/1"})
+    with urlopen(req, timeout=25) as resp:
+        text = resp.read().decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    rows = []
+    for raw in reader:
+        agent = _row_value(raw, "agent", "agent_label", "label")
+        machine = _row_value(raw, "machine", "hostname", "host")
+        if not (agent or machine):
+            continue
+        generated = _parse_iso_ts(_row_value(raw, "generated_at", "heartbeat_at", "updated_at"))
+        age_minutes = None
+        status = "gray"
+        if generated:
+            age_minutes = max(0, round((now - generated.astimezone(MELBOURNE_TZ)).total_seconds() / 60, 1))
+            status = "green" if age_minutes <= 30 else "warn" if age_minutes <= 90 else "bad"
+        row = {
+            "agent": agent,
+            "machine": machine,
+            "os": _row_value(raw, "os"),
+            "current_account_alias": _row_value(raw, "current_account_alias", "account_alias", "alias"),
+            "auth_fingerprint": _row_value(raw, "auth_fingerprint", "auth_hash")[:80],
+            "tokens_24h": _intish(_row_value(raw, "tokens_24h", "tokens_1d")),
+            "tokens_7d": _intish(_row_value(raw, "tokens_7d", "tokens_week")),
+            "thread_count_24h": _intish(_row_value(raw, "thread_count_24h", "threads_24h")),
+            "thread_count_7d": _intish(_row_value(raw, "thread_count_7d", "threads_7d")),
+            "rate_limit_errors_24h": _intish(_row_value(raw, "rate_limit_errors_24h", "rate_limits_24h")),
+            "last_used_at": _row_value(raw, "last_used_at"),
+            "generated_at": generated.isoformat() if generated else _row_value(raw, "generated_at", "heartbeat_at", "updated_at"),
+            "age_minutes": age_minutes,
+            "status": status,
+        }
+        rows.append(row)
+    rows.sort(key=lambda r: r.get("tokens_24h", 0), reverse=True)
+    result = {
+        "ok": True,
+        "configured": True,
+        "source": "google_sheet_csv",
+        "sheet_csv_url": source,
+        "fetched_at": now.isoformat(),
+        "row_count": len(rows),
+        "totals": {
+            "tokens_24h": sum(r["tokens_24h"] for r in rows),
+            "tokens_7d": sum(r["tokens_7d"] for r in rows),
+            "rate_limit_errors_24h": sum(r["rate_limit_errors_24h"] for r in rows),
+        },
+        "rows": rows,
+    }
+    MACHINE_USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    MACHINE_USAGE_CACHE.write_text(json.dumps(result, indent=2) + "\n")
+    os.chmod(MACHINE_USAGE_CACHE, 0o600)
+    return result
 
 
 def parse_profiles_from_output(stdout: str) -> list[dict]:
@@ -633,6 +752,17 @@ INDEX_HTML = r"""
     <div id="tokenRows"></div>
   </section>
   <section class="card" style="margin-top:18px">
+    <div class="alias">Machine usage — Google Sheet</div>
+    <p class="muted">Each machine updates one row in a shared Google Sheet. Paste the Sheet's CSV export/publish URL here; dashboard ranks machines by local observed tokens.</p>
+    <div class="row" style="align-items:flex-end; flex-wrap:wrap">
+      <label style="flex:1; min-width:360px"><span class="muted">Published/export CSV URL</span><input id="machineSheetUrl" placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv&gid=0" /></label>
+      <button onclick="saveMachineSheetUrl()">Save source</button>
+      <button onclick="loadMachineUsage(true)">Refresh machine usage</button>
+    </div>
+    <div id="machineUsageSummary" style="margin-top:10px"></div>
+    <div id="machineUsageRows"></div>
+  </section>
+  <section class="card" style="margin-top:18px">
     <div class="alias">Auth setup links</div>
     <p class="muted">Open each local link below, then click the OpenAI device page and enter the displayed code. Use different browser profiles/incognito sessions if you need to keep accounts separate.</p>
     <div class="actions" id="authLinks"></div>
@@ -791,6 +921,24 @@ async function loadTokenUsage(){
   if(!rows.length){ document.getElementById('tokenRows').innerHTML = '<div class="muted">No local Codex token rows found for this filter.</div>'; return; }
   document.getElementById('tokenRows').innerHTML = `<table class="token-table"><thead><tr><th>Time</th><th>Tokens</th><th>Model</th><th>Thread</th></tr></thead><tbody>${rows.slice(0,50).map(r=>r.error ? `<tr><td>${escapeHtml(r.source_db)}</td><td colspan="3" class="bad">${escapeHtml(r.error)}</td></tr>` : `<tr><td>${escapeHtml(r.updated_at_iso||'')}</td><td>${Number(r.tokens_used||0).toLocaleString()}</td><td>${escapeHtml(r.model||'')}</td><td>${escapeHtml(r.title||r.thread_id||'')}</td></tr>`).join('')}</tbody></table>`;
 }
+async function saveMachineSheetUrl(){
+  const url = document.getElementById('machineSheetUrl').value.trim();
+  const res = await api('/api/machine-usage/source', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})});
+  if(!res.ok){ alert(res.error || 'Save machine sheet URL failed'); return; }
+  await loadMachineUsage(true);
+}
+async function loadMachineUsage(force=false){
+  const data = await api(`/api/machine-usage${force?'?force=1':''}`);
+  if(data.sheet_csv_url) document.getElementById('machineSheetUrl').value = data.sheet_csv_url;
+  const summary = document.getElementById('machineUsageSummary');
+  const table = document.getElementById('machineUsageRows');
+  if(!data.ok){ summary.innerHTML = `<div class="bad">${escapeHtml(data.error||'Machine usage load failed')}</div>`; table.innerHTML=''; return; }
+  if(!data.configured){ summary.innerHTML = `<div class="muted">${escapeHtml(data.message||'Set a Google Sheet CSV URL first.')}</div>`; table.innerHTML=''; return; }
+  summary.innerHTML = `<div><span class="summary-number">${Number(data.totals?.tokens_24h||0).toLocaleString()}</span> tokens / 24h · ${Number(data.totals?.tokens_7d||0).toLocaleString()} / 7d · ${Number(data.row_count||0)} machines</div><div class="muted">Fetched: ${escapeHtml(data.fetched_at||'')} ${data.cache_hit?'· cached':''}</div>`;
+  const rows = data.rows || [];
+  if(!rows.length){ table.innerHTML = '<div class="muted">No machine rows found in the sheet.</div>'; return; }
+  table.innerHTML = `<table class="token-table"><thead><tr><th>Status</th><th>Agent</th><th>Machine</th><th>Account</th><th>24h tokens</th><th>7d tokens</th><th>Last used</th><th>Heartbeat age</th><th>Rate limits</th></tr></thead><tbody>${rows.map(r=>`<tr><td class="${escapeHtml(r.status||'')}">●</td><td>${escapeHtml(r.agent)}</td><td>${escapeHtml(r.machine)}<div class="muted">${escapeHtml(r.os||'')}</div></td><td>${escapeHtml(r.current_account_alias||'')}</td><td>${Number(r.tokens_24h||0).toLocaleString()}</td><td>${Number(r.tokens_7d||0).toLocaleString()}</td><td>${escapeHtml(r.last_used_at||'')}</td><td>${r.age_minutes==null?'unknown':`${r.age_minutes}m`}</td><td>${Number(r.rate_limit_errors_24h||0).toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
+}
 async function refreshAll(){
   const data = await api('/api/accounts');
   expected = data.accounts_config || expected || [];
@@ -813,7 +961,7 @@ async function refreshAll(){
 function renderAuthLinks(){
   document.getElementById('authLinks').innerHTML = expected.map(e=>`<a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Authorize ${escapeHtml(e.label)}</a>`).join('');
 }
-initTokenFilters(); refreshAll(); loadTokenUsage(); setInterval(refreshAll, 15000);
+initTokenFilters(); refreshAll(); loadTokenUsage(); loadMachineUsage(); setInterval(refreshAll, 15000); setInterval(loadMachineUsage, 30000);
 </script>
 </body>
 </html>
@@ -884,6 +1032,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(get_local_token_usage(qs.get("start", [None])[0], qs.get("end", [None])[0]))
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if path == "/api/machine-usage":
+            qs = parse_qs(parsed.query)
+            try:
+                return self.send_json(get_machine_usage(force=qs.get("force", [""])[0] in {"1", "true", "yes"}))
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc), "configured": bool(get_machine_usage_source())}, 400)
         if path == "/api/login/status":
             alias = parse_qs(parsed.query).get("alias", [""])[0]
             sess = get_session(alias)
@@ -926,6 +1080,12 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json_body()
                 result = build_share_auth(str(body.get("alias") or ""))
                 return self.send_json(result)
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/machine-usage/source":
+            try:
+                body = self.read_json_body()
+                return self.send_json(set_machine_usage_source(str(body.get("url") or "")))
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
         if parsed.path == "/api/accounts/remove":

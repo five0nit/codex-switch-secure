@@ -110,6 +110,41 @@ curl -X POST http://localhost:8787/api/accounts/name \
   -d '{"alias":"spare-pro-1","label":"Spare Pro 1"}'
 ```
 
+## Machine usage via Google Sheet
+
+Use **Option C** with one shared Google Sheet. The dashboard reads a CSV export/publish URL and ranks machines by local observed token usage.
+
+Template columns are in `local-web/google-sheet-template.csv`:
+
+```csv
+agent,machine,os,generated_at,current_account_alias,auth_fingerprint,tokens_24h,tokens_7d,thread_count_24h,thread_count_7d,last_used_at,rate_limit_errors_24h
+```
+
+Recommended sheet structure:
+
+- Google Drive folder: `Codex Usage Telemetry`
+- Google Sheet: `Codex Machine Usage Telemetry`
+- Tab: `machine_usage`
+- One row per machine/agent.
+- Each machine updates only its own row every 15 minutes.
+- Dashboard scrapes the Sheet CSV every 30 minutes and caches the result locally.
+
+Set the source from the dashboard's **Machine usage — Google Sheet** card, or programmatically:
+
+```bash
+curl -X POST http://localhost:8787/api/machine-usage/source \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://docs.google.com/spreadsheets/d/<SHEET_ID>/export?format=csv&gid=<GID>"}'
+```
+
+Read current rollup:
+
+```text
+http://localhost:8787/api/machine-usage
+```
+
+Important limitation: this is local observed telemetry pushed by each machine, not an official OpenAI per-machine billing ledger.
+
 ## Usage details
 
 Account cards show both allowance windows with exact local reset date/time, e.g. the 5h reset and 7d/weekly reset.
