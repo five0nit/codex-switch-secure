@@ -33,6 +33,8 @@ Use separate browser profiles/incognito windows when authorizing different OpenA
 
 Each account card has an editable display-name field. Click **Save name** to persist the label.
 
+Drag cards left/right using the card body or **↔ drag to reorder** handle. The order is saved to `~/.codex-switch/local-web-config.json` and persists across refreshes/restarts.
+
 The account cards are laid out as one horizontal strip so all accounts can be scanned left-to-right. Use horizontal scroll if your window is not wide enough.
 
 Each card also has a **Remove** button. It removes the dashboard slot and deletes the saved local codex-switch profile for that alias when present.

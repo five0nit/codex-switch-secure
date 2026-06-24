@@ -147,6 +147,33 @@ def set_account_label(alias: str, label: str) -> dict:
         return acct
 
 
+def reorder_accounts(aliases: list[str]) -> dict:
+    clean_aliases = []
+    seen = set()
+    for alias in aliases:
+        alias = str(alias or "")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+            continue
+        if alias in seen:
+            continue
+        seen.add(alias)
+        clean_aliases.append(alias)
+    if not clean_aliases:
+        raise ValueError("no valid aliases supplied")
+
+    with config_lock:
+        cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else _default_config()
+        accounts = [a for a in cfg.get("accounts", []) if isinstance(a, dict)]
+        by_alias = {str(a.get("alias")): a for a in accounts if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(a.get("alias", "")))}
+        ordered = []
+        for alias in clean_aliases:
+            ordered.append(by_alias.pop(alias, {"alias": alias, "label": alias, "expected_plan": ""}))
+        ordered.extend(by_alias.values())
+        cfg["accounts"] = ordered
+        save_config_unlocked(cfg)
+    return {"ok": True, "accounts": get_expected_accounts()}
+
+
 def parse_profiles_from_output(stdout: str) -> list[dict]:
     parsed = json_from_mixed_stdout(stdout)
     if isinstance(parsed, dict) and isinstance(parsed.get("profiles"), list):
@@ -491,6 +518,9 @@ INDEX_HTML = r"""
     main { padding:18px; max-width:none; width:100%; margin:0; }
     .grid { display:flex; flex-wrap:nowrap; gap:12px; overflow-x:auto; overflow-y:hidden; padding:4px 4px 18px; scroll-snap-type:x proximity; }
     .grid .card { flex:0 0 265px; min-width:265px; scroll-snap-align:start; }
+    .grid .card.dragging { opacity:.45; outline:2px dashed var(--blue); }
+    .drag-handle { cursor:grab; user-select:none; color:var(--muted); font-size:12px; margin-bottom:8px; display:inline-flex; gap:5px; align-items:center; }
+    .drag-handle:active { cursor:grabbing; }
     .card { background:rgba(17,25,35,.94); border:1px solid var(--line); border-radius:16px; padding:14px; box-shadow:0 8px 30px rgba(0,0,0,.25); }
     .row { display:flex; justify-content:space-between; gap:8px; align-items:center; }
     .alias { font-size:16px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:180px; }
@@ -539,7 +569,7 @@ INDEX_HTML = r"""
     </div>
     <div class="muted" id="addAccountStatus"></div>
   </section>
-  <section class="grid" id="cards"></section>
+  <section class="grid" id="cards" aria-label="Account cards. Drag cards left or right to reorder."></section>
   <section class="card" style="margin-top:18px">
     <div class="alias">Token usage explorer</div>
     <p class="muted">OpenAI's Codex usage endpoint shows allowance % and reset times, not official token totals. This section reads local Codex thread token counters when available, with date/time filters.</p>
@@ -622,6 +652,40 @@ async function removeAccount(alias, label){
   if(!res.ok) alert(res.profile_error || res.error || 'Remove failed');
   await refreshAll();
 }
+async function saveCardOrder(){
+  const aliases = [...document.querySelectorAll('#cards .card[data-alias]')].map(el=>el.dataset.alias).filter(Boolean);
+  if(!aliases.length) return;
+  const res = await api('/api/accounts/reorder', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({aliases})});
+  if(!res.ok) alert(res.error || 'Reorder failed');
+}
+function setupDragReorder(){
+  const grid = document.getElementById('cards');
+  if(!grid) return;
+  let dragged = null;
+  grid.querySelectorAll('.card[data-alias]').forEach(card=>{
+    card.draggable = true;
+    card.addEventListener('dragstart', ev=>{
+      if(ev.target.closest('input,button,a')) { ev.preventDefault(); return; }
+      dragged = card;
+      card.classList.add('dragging');
+      ev.dataTransfer.effectAllowed = 'move';
+      ev.dataTransfer.setData('text/plain', card.dataset.alias || '');
+    });
+    card.addEventListener('dragend', async ()=>{
+      card.classList.remove('dragging');
+      dragged = null;
+      await saveCardOrder();
+    });
+  });
+  grid.ondragover = ev=>{
+    ev.preventDefault();
+    const active = dragged || grid.querySelector('.dragging');
+    if(!active) return;
+    const cards = [...grid.querySelectorAll('.card[data-alias]:not(.dragging)')];
+    const next = cards.find(c => ev.clientX < c.getBoundingClientRect().left + c.offsetWidth / 2);
+    grid.insertBefore(active, next || null);
+  };
+}
 async function forceRefresh(){
   document.getElementById('scheduler').innerText = 'Force refresh running…';
   const res = await api('/api/refresh', {method:'POST'});
@@ -657,13 +721,14 @@ async function refreshAll(){
   const merged = [...expected.map(e=>({expected:e, profile:byAlias[e.alias]})), ...profiles.filter(p=>!expected.find(e=>e.alias===p.alias)).map(p=>({expected:{alias:p.alias,label:p.alias,expected_plan:''}, profile:p}))];
   document.getElementById('cards').innerHTML = merged.map(({expected:e, profile:p})=>{
     const usage=p?.usage||{}; const acct=p?.account||{}; const status=p?'Connected':'Not connected';
-    return `<article class="card"><div class="row"><div><div class="alias">${escapeHtml(e.label)}</div><div class="muted">alias: ${escapeHtml(e.alias)}</div></div><span class="pill ${p?'ok':'warn'}">${status}</span></div>
+    return `<article class="card" data-alias="${escapeHtml(e.alias)}" title="Drag left/right to reorder"><div class="drag-handle">↔ drag to reorder</div><div class="row"><div><div class="alias">${escapeHtml(e.label)}</div><div class="muted">alias: ${escapeHtml(e.alias)}</div></div><span class="pill ${p?'ok':'warn'}">${status}</span></div>
       <label class="muted">Display name</label><input id="name-${escapeHtml(e.alias)}" value="${escapeHtml(e.label)}" maxlength="120" />
       <div class="actions"><button onclick="saveName('${escapeHtml(e.alias)}')">Save name</button></div>
       <p class="muted">Plan: ${escapeHtml(acct.plan||e.expected_plan||'unknown')} ${p?.is_current?'· current':''}</p>
       ${bar('5h', usage.primary)}${bar('7d / weekly', usage.secondary)}
       <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Auth</a><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Remove</button></div></article>`;
   }).join('');
+  setupDragReorder();
   renderAuthLinks();
 }
 function renderAuthLinks(){
@@ -768,6 +833,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json_body()
                 acct = set_account_label(str(body.get("alias") or ""), str(body.get("label") or ""))
                 return self.send_json({"ok": True, "account": acct, "accounts": get_expected_accounts()})
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/accounts/reorder":
+            try:
+                body = self.read_json_body()
+                result = reorder_accounts(body.get("aliases") or [])
+                return self.send_json(result)
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
         if parsed.path == "/api/accounts/remove":
