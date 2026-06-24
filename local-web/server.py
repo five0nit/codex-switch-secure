@@ -11,6 +11,7 @@ import html
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import threading
 import time
@@ -27,6 +28,7 @@ CONFIG_PATH = Path(os.environ.get("CODEX_SWITCH_WEB_CONFIG", str(Path.home() / "
 MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
 REFRESH_INTERVAL_SECONDS = 30 * 60
 DEVICE_URL_FALLBACK = "https://auth.openai.com/codex/device"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 DEFAULT_ACCOUNTS = [
     {"alias": "pro-1", "label": "Pro account 1", "expected_plan": "pro"},
     {"alias": "pro-2", "label": "Pro account 2", "expected_plan": "pro"},
@@ -205,6 +207,79 @@ def get_profiles(force: bool = False) -> dict:
         return {"ok": True, **parsed}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "accounts_config": get_expected_accounts(), "refresh_state": get_refresh_state()}
+
+
+def parse_filter_ts(value: str | None, default: datetime) -> int:
+    if not value:
+        dt = default
+    else:
+        cleaned = value.strip()
+        if cleaned.endswith("Z"):
+            cleaned = cleaned[:-1] + "+00:00"
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MELBOURNE_TZ)
+    return int(dt.timestamp())
+
+
+def get_local_token_usage(start_s: str | None, end_s: str | None) -> dict:
+    now = datetime.now(MELBOURNE_TZ)
+    start = parse_filter_ts(start_s, now - timedelta(days=1))
+    end = parse_filter_ts(end_s, now)
+    if end < start:
+        start, end = end, start
+
+    rows = []
+    total = 0
+    db_files = sorted(CODEX_HOME.glob("state_*.sqlite"))
+    for db_path in db_files:
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+            con.row_factory = sqlite3.Row
+            exists = con.execute("select 1 from sqlite_master where type='table' and name='threads'").fetchone()
+            if not exists:
+                con.close()
+                continue
+            for row in con.execute(
+                """
+                select id, title, created_at, updated_at, tokens_used, model
+                from threads
+                where coalesce(updated_at, created_at, 0) between ? and ?
+                  and coalesce(tokens_used, 0) > 0
+                order by coalesce(updated_at, created_at, 0) desc
+                limit 500
+                """,
+                (start, end),
+            ):
+                tokens = int(row["tokens_used"] or 0)
+                total += tokens
+                updated = int(row["updated_at"] or row["created_at"] or 0)
+                rows.append({
+                    "thread_id": row["id"],
+                    "title": row["title"] or "Untitled",
+                    "model": row["model"],
+                    "tokens_used": tokens,
+                    "updated_at": updated,
+                    "updated_at_iso": datetime.fromtimestamp(updated, MELBOURNE_TZ).isoformat() if updated else None,
+                    "source_db": db_path.name,
+                })
+            con.close()
+        except Exception as exc:
+            rows.append({"source_db": db_path.name, "error": str(exc), "tokens_used": 0})
+
+    return {
+        "ok": True,
+        "source": "local_codex_state_sqlite",
+        "scope": "local machine / all Codex CLI threads; OpenAI does not expose official per-seat token totals through the current Codex usage endpoint",
+        "per_account_attribution": False,
+        "start": start,
+        "end": end,
+        "start_iso": datetime.fromtimestamp(start, MELBOURNE_TZ).isoformat(),
+        "end_iso": datetime.fromtimestamp(end, MELBOURNE_TZ).isoformat(),
+        "total_tokens": total,
+        "thread_count": len([r for r in rows if not r.get("error")]),
+        "rows": rows[:500],
+    }
 
 
 def is_business_slot(dt: datetime) -> bool:
@@ -433,6 +508,10 @@ INDEX_HTML = r"""
     pre { white-space:pre-wrap; max-height:220px; overflow:auto; }
     .actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
     .top-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
+    .token-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12px; }
+    .token-table th, .token-table td { border-bottom:1px solid var(--line); padding:7px 6px; text-align:left; }
+    .token-table th { color:var(--muted); font-weight:700; }
+    .summary-number { font-size:24px; font-weight:900; color:var(--green); }
   </style>
 </head>
 <body>
@@ -462,6 +541,17 @@ INDEX_HTML = r"""
   </section>
   <section class="grid" id="cards"></section>
   <section class="card" style="margin-top:18px">
+    <div class="alias">Token usage explorer</div>
+    <p class="muted">OpenAI's Codex usage endpoint shows allowance % and reset times, not official token totals. This section reads local Codex thread token counters when available, with date/time filters.</p>
+    <div class="row" style="align-items:flex-end; flex-wrap:wrap">
+      <label style="flex:1; min-width:220px"><span class="muted">Start</span><input id="tokenStart" type="datetime-local" /></label>
+      <label style="flex:1; min-width:220px"><span class="muted">End</span><input id="tokenEnd" type="datetime-local" /></label>
+      <button onclick="loadTokenUsage()">Load token usage</button>
+    </div>
+    <div id="tokenSummary" style="margin-top:10px"></div>
+    <div id="tokenRows"></div>
+  </section>
+  <section class="card" style="margin-top:18px">
     <div class="alias">Auth setup links</div>
     <p class="muted">Open each local link below, then click the OpenAI device page and enter the displayed code. Use different browser profiles/incognito sessions if you need to keep accounts separate.</p>
     <div class="actions" id="authLinks"></div>
@@ -471,10 +561,24 @@ INDEX_HTML = r"""
 let expected = [];
 function escapeHtml(s){ return String(s||'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
 function pct(n){ return Math.max(0, Math.min(100, Number(n||0))); }
+function fmtDate(ts){
+  if(!ts) return 'unknown';
+  return new Date(Number(ts)*1000).toLocaleString(undefined, {weekday:'short', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+}
+function fmtFullDate(ts){
+  if(!ts) return 'unknown';
+  return new Date(Number(ts)*1000).toLocaleString();
+}
+function resetLine(label, win){
+  if(!win || !win.resets_at) return `<div class="muted">${label} reset: unknown</div>`;
+  const hrs = Math.max(0, (win.resets_in_seconds||0)/3600);
+  const rel = hrs < 1 ? `${Math.round(hrs*60)}m` : `${hrs.toFixed(1)}h`;
+  return `<div class="muted">${label} reset: <b>${fmtDate(win.resets_at)}</b> · in ${rel}</div>`;
+}
 function bar(label, win){
   if(!win) return `<div class="muted">${label}: no data</div>`;
   const p=pct(win.used_percent), cls=p>=90?'bad':p>=70?'warn':'ok';
-  return `<div><div class="row"><span>${label}</span><span class="${cls}">${p.toFixed(1)}% used · ${(100-p).toFixed(1)}% left</span></div><div class="bar"><div class="fill ${cls}" style="width:${p}%"></div></div><div class="muted">resets in ${Math.max(0, Math.round((win.resets_in_seconds||0)/3600))}h</div></div>`;
+  return `<div><div class="row"><span>${label}</span><span class="${cls}">${p.toFixed(1)}% used · ${(100-p).toFixed(1)}% left</span></div><div class="bar"><div class="fill ${cls}" style="width:${p}%"></div></div>${resetLine(label, win)}</div>`;
 }
 async function api(path, opts){ const r=await fetch(path, opts); return await r.json(); }
 function renderScheduler(state){
@@ -524,6 +628,26 @@ async function forceRefresh(){
   if(!res.ok) alert(res.error || 'Refresh failed');
   await refreshAll();
 }
+function localDatetime(dt){
+  const pad=n=>String(n).padStart(2,'0');
+  return `${dt.getFullYear()}-${pad(dt.getMonth()+1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+}
+function initTokenFilters(){
+  const end = new Date();
+  const start = new Date(end.getTime() - 24*3600*1000);
+  document.getElementById('tokenStart').value = localDatetime(start);
+  document.getElementById('tokenEnd').value = localDatetime(end);
+}
+async function loadTokenUsage(){
+  const start = encodeURIComponent(document.getElementById('tokenStart').value || '');
+  const end = encodeURIComponent(document.getElementById('tokenEnd').value || '');
+  const data = await api(`/api/local-token-usage?start=${start}&end=${end}`);
+  if(!data.ok){ alert(data.error || 'Token usage load failed'); return; }
+  document.getElementById('tokenSummary').innerHTML = `<div><span class="summary-number">${Number(data.total_tokens||0).toLocaleString()}</span> tokens · ${Number(data.thread_count||0).toLocaleString()} threads</div><div class="muted">${escapeHtml(data.start_iso)} → ${escapeHtml(data.end_iso)}</div><div class="muted">${escapeHtml(data.scope)}</div>`;
+  const rows = data.rows || [];
+  if(!rows.length){ document.getElementById('tokenRows').innerHTML = '<div class="muted">No local Codex token rows found for this filter.</div>'; return; }
+  document.getElementById('tokenRows').innerHTML = `<table class="token-table"><thead><tr><th>Time</th><th>Tokens</th><th>Model</th><th>Thread</th></tr></thead><tbody>${rows.slice(0,50).map(r=>r.error ? `<tr><td>${escapeHtml(r.source_db)}</td><td colspan="3" class="bad">${escapeHtml(r.error)}</td></tr>` : `<tr><td>${escapeHtml(r.updated_at_iso||'')}</td><td>${Number(r.tokens_used||0).toLocaleString()}</td><td>${escapeHtml(r.model||'')}</td><td>${escapeHtml(r.title||r.thread_id||'')}</td></tr>`).join('')}</tbody></table>`;
+}
 async function refreshAll(){
   const data = await api('/api/accounts');
   expected = data.accounts_config || expected || [];
@@ -545,7 +669,7 @@ async function refreshAll(){
 function renderAuthLinks(){
   document.getElementById('authLinks').innerHTML = expected.map(e=>`<a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Authorize ${escapeHtml(e.label)}</a>`).join('');
 }
-refreshAll(); setInterval(refreshAll, 15000);
+initTokenFilters(); refreshAll(); loadTokenUsage(); setInterval(refreshAll, 15000);
 </script>
 </body>
 </html>
@@ -610,6 +734,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(get_profiles())
         if path == "/api/config":
             return self.send_json({"ok": True, "accounts": get_expected_accounts(), "refresh_state": get_refresh_state()})
+        if path == "/api/local-token-usage":
+            qs = parse_qs(parsed.query)
+            try:
+                return self.send_json(get_local_token_usage(qs.get("start", [None])[0], qs.get("end", [None])[0]))
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
         if path == "/api/login/status":
             alias = parse_qs(parsed.query).get("alias", [""])[0]
             sess = get_session(alias)

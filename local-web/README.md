@@ -86,6 +86,18 @@ curl -X POST http://localhost:8787/api/accounts/name \
   -d '{"alias":"spare-pro-1","label":"Spare Pro 1"}'
 ```
 
+## Usage details
+
+Account cards show both allowance windows with exact local reset date/time, e.g. the 5h reset and 7d/weekly reset.
+
+The **Token usage explorer** has start/end date-time filters and reads local Codex state SQLite thread counters from:
+
+```text
+~/.codex/state_*.sqlite
+```
+
+Important limitation: OpenAI's current Codex usage endpoint exposes allowance percentages and reset times, but not official token totals per workgroup seat. The token explorer is therefore local observed Codex thread usage for this machine, not authoritative OpenAI billing/quota data and not reliably attributable to a specific seat unless Codex records that metadata in future.
+
 Scheduler state is visible in the dashboard and in:
 
 ```text
