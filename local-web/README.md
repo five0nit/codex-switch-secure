@@ -47,6 +47,28 @@ Labels are stored in:
 
 This only changes the web-dashboard label; it does not rewrite OAuth tokens.
 
+## Sharing / repointing auth
+
+Each connected account card has a **Share Auth** button for rate-limit failover.
+
+It shows two command styles:
+
+1. **Same-machine repoint** — safest/fastest when the impacted Hermes/Codex agent runs as the same Linux user:
+
+```bash
+~/.local/bin/codex-switch-secure use <alias>
+```
+
+2. **Payload installer** — copy/paste command for another trusted machine/user. This command contains the OAuth auth payload and writes it to `~/.codex/auth.json` on the target.
+
+Security rules:
+
+- Treat the payload installer like a password.
+- Do not paste it into Telegram, GitHub, logs, or shared docs.
+- Only use it on your own trusted agent machines.
+- If exposed, re-auth/rotate that account.
+- The dashboard also writes a chmod-600 local bundle under `~/.codex-switch/share/` for file-copy workflows.
+
 ## Auto refresher
 
 The web server starts a background scheduler automatically.

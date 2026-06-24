@@ -7,10 +7,13 @@ Includes editable display names and a Melbourne-business-hours force refresher.
 """
 from __future__ import annotations
 
+import base64
 import html
 import json
 import os
 import re
+import secrets
+import shlex
 import sqlite3
 import subprocess
 import threading
@@ -25,6 +28,8 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("CODEX_SWITCH_WEB_PORT", "8787"))
 BIN = os.environ.get("CODEX_SWITCH_BIN", str(Path.home() / ".local/bin/codex-switch-secure"))
 CONFIG_PATH = Path(os.environ.get("CODEX_SWITCH_WEB_CONFIG", str(Path.home() / ".codex-switch/local-web-config.json")))
+PROFILE_ROOT = Path(os.environ.get("CODEX_SWITCH_PROFILE_ROOT", str(Path.home() / ".codex-switch/profiles")))
+SHARE_DIR = Path(os.environ.get("CODEX_SWITCH_SHARE_DIR", str(Path.home() / ".codex-switch/share")))
 MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
 REFRESH_INTERVAL_SECONDS = 30 * 60
 DEVICE_URL_FALLBACK = "https://auth.openai.com/codex/device"
@@ -172,6 +177,47 @@ def reorder_accounts(aliases: list[str]) -> dict:
         cfg["accounts"] = ordered
         save_config_unlocked(cfg)
     return {"ok": True, "accounts": get_expected_accounts()}
+
+
+def build_share_auth(alias: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+        raise ValueError("invalid alias")
+    auth_path = PROFILE_ROOT / alias / "auth.json"
+    if not auth_path.exists():
+        raise FileNotFoundError(f"saved auth profile not found for {alias}")
+    raw = auth_path.read_bytes()
+    # Validate shape but never return parsed token values.
+    parsed = json.loads(raw.decode())
+    if not isinstance(parsed, dict):
+        raise ValueError("auth file is not a JSON object")
+
+    SHARE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(SHARE_DIR, 0o700)
+    bundle_path = SHARE_DIR / f"{alias}-{secrets.token_urlsafe(8)}.auth.json"
+    bundle_path.write_bytes(raw)
+    os.chmod(bundle_path, 0o600)
+
+    b64 = base64.b64encode(raw).decode()
+    q_alias = shlex.quote(alias)
+    q_bundle = shlex.quote(str(bundle_path))
+    q_bin = shlex.quote(BIN)
+    payload_cmd = (
+        "umask 077; mkdir -p ~/.codex; "
+        "base64 -d > ~/.codex/auth.json <<'AUTH_PAYLOAD'\n"
+        f"{b64}\n"
+        "AUTH_PAYLOAD\n"
+        "chmod 600 ~/.codex/auth.json"
+    )
+    return {
+        "ok": True,
+        "alias": alias,
+        "bundle_path": str(bundle_path),
+        "warning": "Sensitive OAuth auth payload. Only paste/share with your own trusted agent machine. Rotate/re-auth if exposed.",
+        "same_machine_switch_command": f"{q_bin} use {q_alias}",
+        "same_machine_install_command": f"umask 077; mkdir -p ~/.codex; install -m 600 {q_bundle} ~/.codex/auth.json",
+        "target_machine_payload_install_command": payload_cmd,
+        "target_machine_import_command_note": f"If you copy {bundle_path.name} to another machine, import it there with: {q_bin} import /path/to/{shlex.quote(bundle_path.name)} {q_alias}",
+    }
 
 
 def parse_profiles_from_output(stdout: str) -> list[dict]:
@@ -542,6 +588,11 @@ INDEX_HTML = r"""
     .token-table th, .token-table td { border-bottom:1px solid var(--line); padding:7px 6px; text-align:left; }
     .token-table th { color:var(--muted); font-weight:700; }
     .summary-number { font-size:24px; font-weight:900; color:var(--green); }
+    .modal { position:fixed; inset:0; background:rgba(0,0,0,.72); display:none; align-items:center; justify-content:center; z-index:10; padding:18px; }
+    .modal.open { display:flex; }
+    .modal-card { width:min(980px, 96vw); max-height:90vh; overflow:auto; background:#111923; border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 20px 80px rgba(0,0,0,.55); }
+    textarea { width:100%; min-height:170px; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:10px; padding:10px; font:12px ui-monospace,monospace; }
+    .danger-note { color:#ffd166; border:1px solid #5d4a16; background:#241b08; border-radius:12px; padding:10px; margin:10px 0; }
   </style>
 </head>
 <body>
@@ -587,6 +638,19 @@ INDEX_HTML = r"""
     <div class="actions" id="authLinks"></div>
   </section>
 </main>
+<div class="modal" id="shareModal">
+  <div class="modal-card">
+    <div class="row"><div class="alias" id="shareTitle">Share auth</div><button onclick="closeShareModal()">Close</button></div>
+    <div class="danger-note">Sensitive OAuth auth payload. Only paste/share with your own trusted agent machine. Anyone with this payload can use that Codex auth until revoked/re-authenticated.</div>
+    <p class="muted">Fast local repoint on this same machine:</p>
+    <textarea id="shareLocal" readonly></textarea>
+    <div class="actions"><button onclick="copyText('shareLocal')">Copy local command</button></div>
+    <p class="muted">Copy/paste installer for another trusted machine. This contains the auth payload; do not paste into chats/logs.</p>
+    <textarea id="sharePayload" readonly></textarea>
+    <div class="actions"><button onclick="copyText('sharePayload')">Copy payload installer</button></div>
+    <p class="muted" id="shareBundle"></p>
+  </div>
+</div>
 <script>
 let expected = [];
 function escapeHtml(s){ return String(s||'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
@@ -651,6 +715,21 @@ async function removeAccount(alias, label){
   const res = await api('/api/accounts/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias})});
   if(!res.ok) alert(res.profile_error || res.error || 'Remove failed');
   await refreshAll();
+}
+function closeShareModal(){ document.getElementById('shareModal').classList.remove('open'); }
+async function copyText(id){
+  const el = document.getElementById(id);
+  el.focus(); el.select();
+  await navigator.clipboard.writeText(el.value);
+}
+async function shareAuth(alias, label){
+  const res = await api('/api/accounts/share-auth', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias})});
+  if(!res.ok){ alert(res.error || 'Share auth failed'); return; }
+  document.getElementById('shareTitle').innerText = `Share auth: ${label || alias}`;
+  document.getElementById('shareLocal').value = `${res.same_machine_switch_command}\n# If the target local agent only reads ~/.codex/auth.json, use:\n${res.same_machine_install_command}`;
+  document.getElementById('sharePayload').value = res.target_machine_payload_install_command;
+  document.getElementById('shareBundle').innerText = `Local bundle written: ${res.bundle_path}\n${res.target_machine_import_command_note}`;
+  document.getElementById('shareModal').classList.add('open');
 }
 async function saveCardOrder(){
   const aliases = [...document.querySelectorAll('#cards .card[data-alias]')].map(el=>el.dataset.alias).filter(Boolean);
@@ -726,7 +805,7 @@ async function refreshAll(){
       <div class="actions"><button onclick="saveName('${escapeHtml(e.alias)}')">Save name</button></div>
       <p class="muted">Plan: ${escapeHtml(acct.plan||e.expected_plan||'unknown')} ${p?.is_current?'· current':''}</p>
       ${bar('5h', usage.primary)}${bar('7d / weekly', usage.secondary)}
-      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Auth</a><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Remove</button></div></article>`;
+      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Auth</a><button onclick='shareAuth(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Share Auth</button><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Remove</button></div></article>`;
   }).join('');
   setupDragReorder();
   renderAuthLinks();
@@ -839,6 +918,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = self.read_json_body()
                 result = reorder_accounts(body.get("aliases") or [])
+                return self.send_json(result)
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/accounts/share-auth":
+            try:
+                body = self.read_json_body()
+                result = build_share_auth(str(body.get("alias") or ""))
                 return self.send_json(result)
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
