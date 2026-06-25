@@ -79,7 +79,7 @@ def json_from_mixed_stdout(stdout: str):
 
 
 def _default_config() -> dict:
-    return {"accounts": DEFAULT_ACCOUNTS, "machine_usage_sheet_csv_url": ""}
+    return {"accounts": DEFAULT_ACCOUNTS, "machine_usage_sheet_csv_url": "", "machine_overrides": {}}
 
 
 def load_config() -> dict:
@@ -95,6 +95,8 @@ def load_config() -> dict:
         accounts = cfg.get("accounts") if isinstance(cfg, dict) else None
         if not isinstance(accounts, list):
             cfg = _default_config()
+        if not isinstance(cfg.get("machine_overrides"), dict):
+            cfg["machine_overrides"] = {}
         by_alias = {a.get("alias"): a for a in cfg.get("accounts", []) if isinstance(a, dict)}
         changed = False
         for acct in DEFAULT_ACCOUNTS:
@@ -128,10 +130,13 @@ def get_expected_accounts() -> list[dict]:
         alias = str(acct.get("alias", ""))
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
             continue
+        plan_label = str(acct.get("plan_label") or acct.get("expected_plan") or "")[:120]
         accounts.append({
             "alias": alias,
             "label": str(acct.get("label") or alias)[:120],
-            "expected_plan": str(acct.get("expected_plan") or "")[:80],
+            "expected_plan": plan_label,
+            "plan_label": plan_label,
+            "plan_details": str(acct.get("plan_details") or "")[:500],
         })
     return accounts or DEFAULT_ACCOUNTS.copy()
 
@@ -154,6 +159,66 @@ def set_account_label(alias: str, label: str) -> dict:
         accounts.append(acct)
         save_config_unlocked(cfg)
         return acct
+
+
+def set_account_details(alias: str, label: str | None = None, plan_label: str | None = None, plan_details: str | None = None) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+        raise ValueError("invalid alias")
+    with config_lock:
+        cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else _default_config()
+        accounts = cfg.setdefault("accounts", [])
+        acct = next((a for a in accounts if isinstance(a, dict) and a.get("alias") == alias), None)
+        if acct is None:
+            acct = {"alias": alias, "label": alias, "expected_plan": ""}
+            accounts.append(acct)
+        if label is not None:
+            clean = str(label or "").strip()[:120]
+            if not clean:
+                raise ValueError("display name cannot be empty")
+            acct["label"] = clean
+        if plan_label is not None:
+            clean_plan = str(plan_label or "").strip()[:120]
+            acct["plan_label"] = clean_plan
+            acct["expected_plan"] = clean_plan
+        if plan_details is not None:
+            acct["plan_details"] = str(plan_details or "").strip()[:500]
+        save_config_unlocked(cfg)
+        return acct
+
+
+def _machine_override_key(agent: str, machine: str) -> str:
+    return f"{str(agent or '').strip()}|||{str(machine or '').strip()}"
+
+
+def set_machine_override(agent: str, machine: str, display_machine: str, machine_details: str) -> dict:
+    agent = str(agent or "").strip()[:120]
+    machine = str(machine or "").strip()[:160]
+    if not (agent or machine):
+        raise ValueError("agent or machine is required")
+    display_machine = str(display_machine or "").strip()[:160]
+    machine_details = str(machine_details or "").strip()[:500]
+    key = _machine_override_key(agent, machine)
+    with config_lock:
+        cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else _default_config()
+        overrides = cfg.setdefault("machine_overrides", {})
+        if display_machine or machine_details:
+            overrides[key] = {"display_machine": display_machine, "machine_details": machine_details}
+        else:
+            overrides.pop(key, None)
+        save_config_unlocked(cfg)
+    return {"ok": True, "key": key, "override": {"display_machine": display_machine, "machine_details": machine_details}}
+
+
+def apply_machine_overrides(rows: list[dict]) -> list[dict]:
+    cfg = load_config()
+    overrides = cfg.get("machine_overrides") if isinstance(cfg.get("machine_overrides"), dict) else {}
+    for row in rows:
+        key = _machine_override_key(row.get("agent"), row.get("machine"))
+        override = overrides.get(key) if isinstance(overrides.get(key), dict) else {}
+        row["machine_key"] = key
+        row["display_machine"] = str(override.get("display_machine") or row.get("machine") or "")[:160]
+        row["machine_details"] = str(override.get("machine_details") or "")[:500]
+    return rows
 
 
 def reorder_accounts(aliases: list[str]) -> dict:
@@ -299,6 +364,7 @@ def get_machine_usage(force: bool = False) -> dict:
             fetched_at = _parse_iso_ts(cached.get("fetched_at"))
             if fetched_at and (now - fetched_at).total_seconds() < REFRESH_INTERVAL_SECONDS:
                 cached["cache_hit"] = True
+                cached["rows"] = apply_machine_overrides(cached.get("rows") or [])
                 return cached
         except Exception:
             pass
@@ -357,7 +423,7 @@ def get_machine_usage(force: bool = False) -> dict:
             "tokens_7d": sum(r["tokens_7d"] for r in rows),
             "rate_limit_errors_24h": sum(r["rate_limit_errors_24h"] for r in rows),
         },
-        "rows": rows,
+        "rows": apply_machine_overrides(rows),
     }
     MACHINE_USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
     MACHINE_USAGE_CACHE.write_text(json.dumps(result, indent=2) + "\n")
@@ -702,12 +768,12 @@ INDEX_HTML = r"""
   <style>
     :root { color-scheme: dark; --bg:#0b0f14; --card:#111923; --muted:#8da2b5; --text:#e9f0f6; --line:#223142; --green:#41d17d; --yellow:#ffd166; --red:#ff5d5d; --blue:#62a8ff; --orange:#ff9f43; --purple:#b38cff; }
     * { box-sizing:border-box; }
-    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:radial-gradient(circle at 12% -10%, rgba(98,168,255,.16), transparent 34%), linear-gradient(135deg,#07111f,#101018); color:var(--text); }
+    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:radial-gradient(circle at 12% -10%, rgba(98,168,255,.16), transparent 34%), linear-gradient(135deg,#07111f,#101018); color:var(--text); overflow-x:hidden; }
     header { padding:28px 28px 16px; border-bottom:1px solid var(--line); background:rgba(0,0,0,.34); position:sticky; top:0; backdrop-filter: blur(10px); z-index:2; }
     h1 { margin:0 0 8px; font-size:28px; }
     .sub { color:var(--muted); }
     main { padding:18px; max-width:none; width:100%; margin:0; }
-    .grid { display:flex; flex-wrap:nowrap; gap:14px; overflow-x:auto; overflow-y:hidden; padding:4px 4px 20px; scroll-snap-type:x proximity; }
+    .grid { display:flex; flex-wrap:nowrap; gap:14px; overflow-x:auto; overflow-y:hidden; padding:4px 4px 20px; scroll-snap-type:x proximity; width:100%; max-width:100%; }
     .grid .card { flex:0 0 312px; min-width:312px; scroll-snap-align:start; }
     .grid .card.dragging { opacity:.45; outline:2px dashed var(--blue); }
     .drag-handle { cursor:grab; user-select:none; color:var(--muted); font-size:12px; margin-bottom:8px; display:inline-flex; gap:5px; align-items:center; }
@@ -760,6 +826,7 @@ INDEX_HTML = r"""
     .muted { color:var(--muted); font-size:12px; }
     .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#05080c; border:1px solid var(--line); border-radius:10px; padding:9px; overflow:auto; }
     input { width:100%; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:9px; padding:8px; margin-top:6px; font-size:13px; }
+    .inline-label { display:block; margin-top:8px; }
     pre { white-space:pre-wrap; max-height:220px; overflow:auto; }
     .actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
     .top-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
@@ -771,6 +838,7 @@ INDEX_HTML = r"""
     .modal.open { display:flex; }
     .modal-card { width:min(980px, 96vw); max-height:90vh; overflow:auto; background:#111923; border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 20px 80px rgba(0,0,0,.55); }
     textarea { width:100%; min-height:170px; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:10px; padding:10px; font:12px ui-monospace,monospace; }
+    textarea.compact { min-height:64px; max-height:110px; margin-top:6px; font:12px Inter, ui-sans-serif, system-ui, sans-serif; }
     .danger-note { color:#ffd166; border:1px solid #5d4a16; background:#241b08; border-radius:12px; padding:10px; margin:10px 0; }
     @keyframes warningSweep { 0%,100%{opacity:.7} 50%{opacity:1} }
     @keyframes criticalSweep { 0%,100%{filter:brightness(.9)} 50%{filter:brightness(1.45)} }
@@ -889,12 +957,14 @@ function usageLevel(primary, secondary, connected=true){
   if(!connected) return 'warn';
   const maxUsed = Math.max(Number(primary?.used_percent||0), Number(secondary?.used_percent||0));
   const soonestReset = Math.min(...[primary?.resets_in_seconds, secondary?.resets_in_seconds].filter(v=>Number(v)>0));
+  if(Number(secondary?.used_percent||0) >= 99) return 'bad';
   if(maxUsed >= 90 || Number(primary?.used_percent||0) >= 88) return 'bad';
   if(maxUsed >= 70 || (Number.isFinite(soonestReset) && soonestReset < 45*60 && maxUsed >= 55)) return 'warn';
   return 'ok';
 }
-function levelLabel(level, connected=true){
+function levelLabel(level, connected=true, primary=null, secondary=null){
   if(!connected) return '⚠ Needs auth';
+  if(Number(secondary?.used_percent||0) >= 99) return '⛔ Rate limit warning';
   return level === 'bad' ? '🚨 Switch soon' : level === 'warn' ? '⚡ Watch usage' : '✓ Healthy';
 }
 function resetText(win){
@@ -928,6 +998,14 @@ async function saveName(alias){
   const label = document.getElementById(`name-${alias}`).value;
   const res = await api('/api/accounts/name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias,label})});
   if(!res.ok) alert(res.error || 'Save failed');
+  await refreshAll();
+}
+async function saveAccountDetails(alias){
+  const label = document.getElementById(`name-${alias}`).value;
+  const plan_label = document.getElementById(`plan-${alias}`).value;
+  const plan_details = document.getElementById(`plan-details-${alias}`).value;
+  const res = await api('/api/accounts/details', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias,label,plan_label,plan_details})});
+  if(!res.ok) alert(res.error || 'Save account details failed');
   await refreshAll();
 }
 function slugifyAlias(label){
@@ -1039,6 +1117,15 @@ async function saveMachineSheetUrl(){
   if(!res.ok){ alert(res.error || 'Save machine sheet URL failed'); return; }
   await loadMachineUsage(true);
 }
+async function saveMachineDetails(agent, machine){
+  const id = btoa(unescape(encodeURIComponent(`${agent}|||${machine}`))).replace(/[^A-Za-z0-9_-]/g,'');
+  const display_machine = document.getElementById(`machine-name-${id}`)?.value || '';
+  const machine_details = document.getElementById(`machine-details-${id}`)?.value || '';
+  const res = await api('/api/machine-usage/details', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent,machine,display_machine,machine_details})});
+  if(!res.ok){ alert(res.error || 'Save machine details failed'); return; }
+  await loadMachineUsage(true);
+}
+function machineDomId(r){ return btoa(unescape(encodeURIComponent(`${r.agent||''}|||${r.machine||''}`))).replace(/[^A-Za-z0-9_-]/g,''); }
 async function loadMachineUsage(force=false){
   const data = await api(`/api/machine-usage${force?'?force=1':''}`);
   if(data.sheet_csv_url) document.getElementById('machineSheetUrl').value = data.sheet_csv_url;
@@ -1060,7 +1147,7 @@ function renderMachineUsageTable(){
     rows = rows.filter(r => [r.status,r.agent,r.machine,r.os,r.current_account_alias,r.last_used_at,r.generated_at].some(v => String(v||'').toLowerCase().includes(filter)));
   }
   if(!rows.length){ table.innerHTML = '<div class="muted">No machine rows match the current filter.</div>'; return; }
-  table.innerHTML = `<table class="token-table"><thead><tr><th>Status</th><th>Agent</th><th>Machine</th><th>Account</th><th>30m</th><th>1h</th><th>2h</th><th>3h</th><th>24h</th><th>7d</th><th>Last used</th><th>Heartbeat age</th><th>Rate limits</th></tr></thead><tbody>${rows.map(r=>`<tr><td class="${escapeHtml(r.status||'')}">●</td><td>${escapeHtml(r.agent)}</td><td>${escapeHtml(r.machine)}<div class="muted">${escapeHtml(r.os||'')}</div></td><td>${escapeHtml(r.current_account_alias||'')}</td><td>${Number(r.tokens_30m||0).toLocaleString()}</td><td>${Number(r.tokens_1h||0).toLocaleString()}</td><td>${Number(r.tokens_2h||0).toLocaleString()}</td><td>${Number(r.tokens_3h||0).toLocaleString()}</td><td>${Number(r.tokens_24h||0).toLocaleString()}</td><td>${Number(r.tokens_7d||0).toLocaleString()}</td><td>${escapeHtml(r.last_used_at||'')}</td><td>${r.age_minutes==null?'unknown':`${r.age_minutes}m`}</td><td>${Number(r.rate_limit_errors_24h||0).toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
+  table.innerHTML = `<table class="token-table"><thead><tr><th>Status</th><th>Agent</th><th>Machine / details</th><th>Account</th><th>30m</th><th>1h</th><th>2h</th><th>3h</th><th>24h</th><th>7d</th><th>Last used</th><th>Heartbeat age</th><th>Rate limits</th></tr></thead><tbody>${rows.map(r=>{ const id=machineDomId(r); return `<tr><td class="${escapeHtml(r.status||'')}">●</td><td>${escapeHtml(r.agent)}</td><td><div class="muted">raw: ${escapeHtml(r.machine)} · ${escapeHtml(r.os||'')}</div><input id="machine-name-${id}" value="${escapeHtml(r.display_machine||r.machine||'')}" maxlength="160" /><textarea class="compact" id="machine-details-${id}" placeholder="Machine details / owner / location / notes" maxlength="500">${escapeHtml(r.machine_details||'')}</textarea><div class="actions"><button onclick='saveMachineDetails(${JSON.stringify(r.agent||'')}, ${JSON.stringify(r.machine||'')})'>Save machine</button></div></td><td>${escapeHtml(r.current_account_alias||'')}</td><td>${Number(r.tokens_30m||0).toLocaleString()}</td><td>${Number(r.tokens_1h||0).toLocaleString()}</td><td>${Number(r.tokens_2h||0).toLocaleString()}</td><td>${Number(r.tokens_3h||0).toLocaleString()}</td><td>${Number(r.tokens_24h||0).toLocaleString()}</td><td>${Number(r.tokens_7d||0).toLocaleString()}</td><td>${escapeHtml(r.last_used_at||'')}</td><td>${r.age_minutes==null?'unknown':`${r.age_minutes}m`}</td><td>${Number(r.rate_limit_errors_24h||0).toLocaleString()}</td></tr>`; }).join('')}</tbody></table>`;
 }
 async function refreshAll(){
   const data = await api('/api/accounts');
@@ -1074,13 +1161,17 @@ async function refreshAll(){
     const primaryPct = pct(usage.primary?.used_percent||0), secondaryPct = pct(usage.secondary?.used_percent||0), maxPct = Math.max(primaryPct, secondaryPct);
     const leftPct = Math.max(0, 100-maxPct);
     const current = p?.is_current ? '<span class="pill ok">active now</span>' : '';
-    const warningCopy = level==='bad' ? 'High burn: switch or let this account cool down before the next heavy run.' : level==='warn' ? 'Approaching warning zone: keep an eye on reset timers before launching big jobs.' : 'Usage is below warning threshold.';
-    return `<article class="card usage-card is-${level}" data-alias="${escapeHtml(e.alias)}" title="Drag left/right to reorder"><div class="usage-card-inner"><div class="drag-handle">↔ drag to reorder</div><div class="row"><div><div class="alias">${escapeHtml(e.label)}</div><div class="muted">alias: ${escapeHtml(e.alias)}</div></div><span class="pill status-badge ${level}">${levelLabel(level, connected)}</span></div>
-      <div class="usage-visual"><div class="usage-ring ${level}" style="--p:${maxPct}"><div class="ring-text">${maxPct.toFixed(0)}%<span>max used</span></div></div><div class="usage-meta"><div class="row"><span class="muted">${escapeHtml(status)}</span>${current}</div>${sparkline(usage.primary, usage.secondary, level)}<div class="muted">Plan: ${escapeHtml(acct.plan||e.expected_plan||'unknown')}</div></div></div>
+    const rateLimitBlocked = Number(usage.secondary?.used_percent||0) >= 99;
+    const warningCopy = rateLimitBlocked ? '7-day usage is 100% used. This is a rate limit warning: 5h usage may be unavailable or irrelevant until the weekly window resets.' : level==='bad' ? 'High burn: switch or let this account cool down before the next heavy run.' : level==='warn' ? 'Approaching warning zone: keep an eye on reset timers before launching big jobs.' : 'Usage is below warning threshold.';
+    const planLabel = e.plan_label || e.expected_plan || acct.plan || '';
+    return `<article class="card usage-card is-${level}" data-alias="${escapeHtml(e.alias)}" title="Drag left/right to reorder"><div class="usage-card-inner"><div class="drag-handle">↔ drag to reorder</div><div class="row"><div><div class="alias">${escapeHtml(e.label)}</div><div class="muted">alias: ${escapeHtml(e.alias)}</div></div><span class="pill status-badge ${level}">${levelLabel(level, connected, usage.primary, usage.secondary)}</span></div>
+      <div class="usage-visual"><div class="usage-ring ${level}" style="--p:${maxPct}"><div class="ring-text">${maxPct.toFixed(0)}%<span>max used</span></div></div><div class="usage-meta"><div class="row"><span class="muted">${escapeHtml(status)}</span>${current}</div>${sparkline(usage.primary, usage.secondary, level)}<div class="muted">Plan: ${escapeHtml(planLabel||'unknown')}</div>${e.plan_details?`<div class="muted">${escapeHtml(e.plan_details)}</div>`:''}</div></div>
       <div class="metric-strip"><div class="mini-metric"><b>${leftPct.toFixed(0)}%</b><span>lowest left</span></div><div class="mini-metric"><b>${resetText(usage.primary)}</b><span>5h window</span></div><div class="mini-metric"><b>${resetText(usage.secondary)}</b><span>weekly</span></div></div>
       <div class="warn-callout"><b>${level==='bad'?'🚨':'⚠'}</b><div>${escapeHtml(warningCopy)}</div></div>
-      <label class="muted">Display name</label><input id="name-${escapeHtml(e.alias)}" value="${escapeHtml(e.label)}" maxlength="120" />
-      <div class="actions"><button onclick="saveName('${escapeHtml(e.alias)}')">Save name</button></div>
+      <label class="muted inline-label">Display name</label><input id="name-${escapeHtml(e.alias)}" value="${escapeHtml(e.label)}" maxlength="120" />
+      <label class="muted inline-label">Plan name</label><input id="plan-${escapeHtml(e.alias)}" value="${escapeHtml(planLabel)}" placeholder="e.g. Team / Pro / Adam's account" maxlength="120" />
+      <label class="muted inline-label">Plan details</label><textarea class="compact" id="plan-details-${escapeHtml(e.alias)}" placeholder="Plan notes, limits, owner, reset notes…" maxlength="500">${escapeHtml(e.plan_details||'')}</textarea>
+      <div class="actions"><button onclick="saveAccountDetails('${escapeHtml(e.alias)}')">Save account details</button></div>
       ${bar('5h', usage.primary)}${bar('7d / weekly', usage.secondary)}
       <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Auth</a><button onclick='shareAuth(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Share Auth</button><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Remove</button></div></div></article>`;
   }).join('');
@@ -1266,6 +1357,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True, "account": acct, "accounts": get_expected_accounts()})
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/accounts/details":
+            try:
+                body = self.read_json_body()
+                acct = set_account_details(str(body.get("alias") or ""), body.get("label"), body.get("plan_label"), body.get("plan_details"))
+                return self.send_json({"ok": True, "account": acct, "accounts": get_expected_accounts()})
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
         if parsed.path == "/api/accounts/reorder":
             try:
                 body = self.read_json_body()
@@ -1284,6 +1382,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = self.read_json_body()
                 return self.send_json(set_machine_usage_source(str(body.get("url") or "")))
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/machine-usage/details":
+            try:
+                body = self.read_json_body()
+                return self.send_json(set_machine_override(str(body.get("agent") or ""), str(body.get("machine") or ""), str(body.get("display_machine") or ""), str(body.get("machine_details") or "")))
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
         if parsed.path == "/api/accounts/remove":
