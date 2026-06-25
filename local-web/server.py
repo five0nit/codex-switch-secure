@@ -700,26 +700,60 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Codex Account Usage</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b0f14; --card:#111923; --muted:#8da2b5; --text:#e9f0f6; --line:#223142; --green:#41d17d; --yellow:#ffd166; --red:#ff5d5d; --blue:#62a8ff; }
+    :root { color-scheme: dark; --bg:#0b0f14; --card:#111923; --muted:#8da2b5; --text:#e9f0f6; --line:#223142; --green:#41d17d; --yellow:#ffd166; --red:#ff5d5d; --blue:#62a8ff; --orange:#ff9f43; --purple:#b38cff; }
     * { box-sizing:border-box; }
-    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:linear-gradient(135deg,#07111f,#101018); color:var(--text); }
-    header { padding:28px 28px 16px; border-bottom:1px solid var(--line); background:rgba(0,0,0,.24); position:sticky; top:0; backdrop-filter: blur(10px); z-index:2; }
+    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:radial-gradient(circle at 12% -10%, rgba(98,168,255,.16), transparent 34%), linear-gradient(135deg,#07111f,#101018); color:var(--text); }
+    header { padding:28px 28px 16px; border-bottom:1px solid var(--line); background:rgba(0,0,0,.34); position:sticky; top:0; backdrop-filter: blur(10px); z-index:2; }
     h1 { margin:0 0 8px; font-size:28px; }
     .sub { color:var(--muted); }
     main { padding:18px; max-width:none; width:100%; margin:0; }
-    .grid { display:flex; flex-wrap:nowrap; gap:12px; overflow-x:auto; overflow-y:hidden; padding:4px 4px 18px; scroll-snap-type:x proximity; }
-    .grid .card { flex:0 0 265px; min-width:265px; scroll-snap-align:start; }
+    .grid { display:flex; flex-wrap:nowrap; gap:14px; overflow-x:auto; overflow-y:hidden; padding:4px 4px 20px; scroll-snap-type:x proximity; }
+    .grid .card { flex:0 0 312px; min-width:312px; scroll-snap-align:start; }
     .grid .card.dragging { opacity:.45; outline:2px dashed var(--blue); }
     .drag-handle { cursor:grab; user-select:none; color:var(--muted); font-size:12px; margin-bottom:8px; display:inline-flex; gap:5px; align-items:center; }
     .drag-handle:active { cursor:grabbing; }
     .card { background:rgba(17,25,35,.94); border:1px solid var(--line); border-radius:16px; padding:14px; box-shadow:0 8px 30px rgba(0,0,0,.25); }
+    .usage-card { position:relative; overflow:hidden; padding:0; isolation:isolate; transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
+    .usage-card:hover { transform:translateY(-2px); border-color:#365674; }
+    .usage-card::before { content:""; position:absolute; inset:0 0 auto; height:4px; background:linear-gradient(90deg,var(--green),var(--blue)); opacity:.85; }
+    .usage-card.is-warn::before { background:linear-gradient(90deg,var(--yellow),var(--orange)); animation:warningSweep 2.6s ease-in-out infinite; }
+    .usage-card.is-bad::before { background:linear-gradient(90deg,var(--red),var(--orange),var(--red)); animation:criticalSweep 1.25s ease-in-out infinite; }
+    .usage-card.is-warn { border-color:rgba(255,209,102,.55); box-shadow:0 0 0 1px rgba(255,209,102,.08),0 14px 42px rgba(255,159,67,.12); }
+    .usage-card.is-bad { border-color:rgba(255,93,93,.74); box-shadow:0 0 0 1px rgba(255,93,93,.18),0 18px 58px rgba(255,93,93,.18); animation:dangerPulse 1.6s ease-in-out infinite; }
+    .usage-card-inner { padding:16px; }
     .row { display:flex; justify-content:space-between; gap:8px; align-items:center; }
-    .alias { font-size:16px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:180px; }
+    .alias { font-size:16px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:190px; }
     .pill { padding:3px 7px; border-radius:999px; background:#1c2a38; color:var(--muted); font-size:11px; white-space:nowrap; }
+    .status-badge { border:1px solid #2c4056; background:#101923; }
+    .status-badge.ok { color:var(--green); border-color:rgba(65,209,125,.35); background:rgba(65,209,125,.08); }
+    .status-badge.warn { color:var(--yellow); border-color:rgba(255,209,102,.55); background:rgba(255,209,102,.1); animation:badgeBlink 2s ease-in-out infinite; }
+    .status-badge.bad { color:var(--red); border-color:rgba(255,93,93,.7); background:rgba(255,93,93,.12); animation:badgeBlink 1s ease-in-out infinite; }
     .ok { color:var(--green); } .warn { color:var(--yellow); } .bad { color:var(--red); }
-    .bar { height:9px; background:#0b1118; border-radius:999px; overflow:hidden; border:1px solid #243447; margin:6px 0 2px; }
-    .fill { height:100%; width:0%; background:var(--green); transition:width .25s; }
-    .fill.warn { background:var(--yellow); } .fill.bad { background:var(--red); }
+    .bar { height:10px; background:#0b1118; border-radius:999px; overflow:hidden; border:1px solid #243447; margin:6px 0 2px; position:relative; }
+    .bar::after { content:""; position:absolute; inset:0; background:linear-gradient(90deg, transparent, rgba(255,255,255,.18), transparent); transform:translateX(-110%); animation:barScan 3.4s ease-in-out infinite; opacity:.45; }
+    .fill { height:100%; width:0%; background:var(--green); transition:width .55s cubic-bezier(.2,.8,.2,1); }
+    .fill.warn { background:linear-gradient(90deg,var(--yellow),var(--orange)); }
+    .fill.bad { background:linear-gradient(90deg,var(--red),var(--orange)); }
+    .usage-visual { display:grid; grid-template-columns:96px 1fr; gap:12px; align-items:center; margin:12px 0 10px; }
+    .usage-ring { --p:0; --ring:var(--green); width:88px; height:88px; border-radius:50%; display:grid; place-items:center; background:conic-gradient(var(--ring) calc(var(--p)*1%), #0b1118 0); box-shadow:inset 0 0 0 1px #25364a,0 0 22px rgba(98,168,255,.08); position:relative; }
+    .usage-ring::after { content:""; position:absolute; inset:10px; border-radius:50%; background:#0f1721; border:1px solid #26384c; }
+    .usage-ring.warn { --ring:var(--yellow); box-shadow:0 0 24px rgba(255,209,102,.18), inset 0 0 0 1px #4d3e14; }
+    .usage-ring.bad { --ring:var(--red); box-shadow:0 0 30px rgba(255,93,93,.25), inset 0 0 0 1px #5a2424; animation:ringAlarm 1.35s ease-in-out infinite; }
+    .ring-text { position:relative; z-index:1; text-align:center; font-weight:900; font-size:19px; line-height:1; }
+    .ring-text span { display:block; font-size:10px; color:var(--muted); font-weight:700; margin-top:3px; }
+    .usage-meta { display:grid; gap:7px; min-width:0; }
+    .meter { border:1px solid #26384c; background:#0c131c; border-radius:12px; padding:8px; }
+    .metric-strip { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin:10px 0; }
+    .mini-metric { border:1px solid #26384c; background:#0b121a; border-radius:10px; padding:8px; min-width:0; }
+    .mini-metric b { display:block; font-size:15px; }
+    .mini-metric span { color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.06em; }
+    .warn-callout { display:none; align-items:flex-start; gap:8px; border-radius:12px; padding:10px; margin:10px 0; border:1px solid rgba(255,209,102,.45); background:rgba(255,209,102,.09); color:#ffe2a3; }
+    .usage-card.is-warn .warn-callout, .usage-card.is-bad .warn-callout { display:flex; }
+    .usage-card.is-bad .warn-callout { border-color:rgba(255,93,93,.6); background:rgba(255,93,93,.1); color:#ffb7b7; }
+    .sparkline { width:100%; height:28px; overflow:visible; }
+    .sparkline path { fill:none; stroke:var(--blue); stroke-width:2; stroke-linecap:round; stroke-linejoin:round; filter:drop-shadow(0 0 5px rgba(98,168,255,.3)); stroke-dasharray:120; animation:drawLine 1.1s ease both; }
+    .sparkline.warn path { stroke:var(--yellow); filter:drop-shadow(0 0 5px rgba(255,209,102,.35)); }
+    .sparkline.bad path { stroke:var(--red); filter:drop-shadow(0 0 6px rgba(255,93,93,.45)); animation:drawLine .85s ease both, jitter .35s steps(2,end) infinite; }
     button, a.btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; border:1px solid #2f4761; background:#16263a; color:var(--text); padding:8px 10px; border-radius:10px; cursor:pointer; text-decoration:none; font-weight:700; font-size:13px; }
     button:hover, a.btn:hover { background:#1d3450; }
     .btn.primary { background:#14539a; border-color:#2e7ccc; }
@@ -738,6 +772,16 @@ INDEX_HTML = r"""
     .modal-card { width:min(980px, 96vw); max-height:90vh; overflow:auto; background:#111923; border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 20px 80px rgba(0,0,0,.55); }
     textarea { width:100%; min-height:170px; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:10px; padding:10px; font:12px ui-monospace,monospace; }
     .danger-note { color:#ffd166; border:1px solid #5d4a16; background:#241b08; border-radius:12px; padding:10px; margin:10px 0; }
+    @keyframes warningSweep { 0%,100%{opacity:.7} 50%{opacity:1} }
+    @keyframes criticalSweep { 0%,100%{filter:brightness(.9)} 50%{filter:brightness(1.45)} }
+    @keyframes dangerPulse { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-1px)} }
+    @keyframes badgeBlink { 0%,100%{box-shadow:0 0 0 rgba(255,209,102,0)} 50%{box-shadow:0 0 16px currentColor} }
+    @keyframes ringAlarm { 0%,100%{transform:scale(1)} 50%{transform:scale(1.025)} }
+    @keyframes barScan { 0%{transform:translateX(-110%)} 55%,100%{transform:translateX(110%)} }
+    @keyframes drawLine { from{stroke-dashoffset:120} to{stroke-dashoffset:0} }
+    @keyframes jitter { 50%{transform:translateX(1px)} }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation:none !important; transition:none !important; } }
+    @media (max-width: 560px) { header{padding:20px 16px 12px} main{padding:12px} .grid .card{flex-basis:86vw; min-width:86vw} .usage-visual{grid-template-columns:82px 1fr} .usage-ring{width:76px;height:76px}.metric-strip{grid-template-columns:1fr 1fr}.alias{max-width:150px} }
   </style>
 </head>
 <body>
@@ -841,10 +885,34 @@ function resetLine(label, win){
   const rel = hrs < 1 ? `${Math.round(hrs*60)}m` : `${hrs.toFixed(1)}h`;
   return `<div class="muted">${label} reset: <b>${fmtDate(win.resets_at)}</b> · in ${rel}</div>`;
 }
+function usageLevel(primary, secondary, connected=true){
+  if(!connected) return 'warn';
+  const maxUsed = Math.max(Number(primary?.used_percent||0), Number(secondary?.used_percent||0));
+  const soonestReset = Math.min(...[primary?.resets_in_seconds, secondary?.resets_in_seconds].filter(v=>Number(v)>0));
+  if(maxUsed >= 90 || Number(primary?.used_percent||0) >= 88) return 'bad';
+  if(maxUsed >= 70 || (Number.isFinite(soonestReset) && soonestReset < 45*60 && maxUsed >= 55)) return 'warn';
+  return 'ok';
+}
+function levelLabel(level, connected=true){
+  if(!connected) return '⚠ Needs auth';
+  return level === 'bad' ? '🚨 Switch soon' : level === 'warn' ? '⚡ Watch usage' : '✓ Healthy';
+}
+function resetText(win){
+  if(!win || !win.resets_at) return 'reset unknown';
+  const hrs = Math.max(0, (win.resets_in_seconds||0)/3600);
+  const rel = hrs < 1 ? `${Math.round(hrs*60)}m` : `${hrs.toFixed(1)}h`;
+  return `${rel} to reset`;
+}
+function sparkline(primary, secondary, level){
+  const a = pct(primary?.used_percent||0), b = pct(secondary?.used_percent||0);
+  const mid = Math.max(8, Math.min(25, 28 - ((a+b)/2)*.18));
+  const end = Math.max(4, 28 - Math.max(a,b)*.24);
+  return `<svg class="sparkline ${level}" viewBox="0 0 120 30" aria-hidden="true"><path d="M2 25 C18 ${mid+3}, 32 ${mid}, 46 ${24-a*.18} S78 ${26-b*.18}, 94 ${end+4} S112 ${end}, 118 ${end+1}"/></svg>`;
+}
 function bar(label, win){
   if(!win) return `<div class="muted">${label}: no data</div>`;
   const p=pct(win.used_percent), cls=p>=90?'bad':p>=70?'warn':'ok';
-  return `<div><div class="row"><span>${label}</span><span class="${cls}">${p.toFixed(1)}% used · ${(100-p).toFixed(1)}% left</span></div><div class="bar"><div class="fill ${cls}" style="width:${p}%"></div></div>${resetLine(label, win)}</div>`;
+  return `<div class="meter"><div class="row"><span>${label}</span><span class="${cls}">${p.toFixed(1)}% used · ${(100-p).toFixed(1)}% left</span></div><div class="bar"><div class="fill ${cls}" style="width:${p}%"></div></div>${resetLine(label, win)}</div>`;
 }
 async function api(path, opts){ const r=await fetch(path, opts); return await r.json(); }
 function renderScheduler(state){
@@ -1002,13 +1070,19 @@ async function refreshAll(){
   const byAlias = Object.fromEntries(profiles.map(p=>[p.alias,p]));
   const merged = [...expected.map(e=>({expected:e, profile:byAlias[e.alias]})), ...profiles.filter(p=>!expected.find(e=>e.alias===p.alias)).map(p=>({expected:{alias:p.alias,label:p.alias,expected_plan:''}, profile:p}))];
   document.getElementById('cards').innerHTML = merged.map(({expected:e, profile:p})=>{
-    const usage=p?.usage||{}; const acct=p?.account||{}; const status=p?'Connected':'Not connected';
-    return `<article class="card" data-alias="${escapeHtml(e.alias)}" title="Drag left/right to reorder"><div class="drag-handle">↔ drag to reorder</div><div class="row"><div><div class="alias">${escapeHtml(e.label)}</div><div class="muted">alias: ${escapeHtml(e.alias)}</div></div><span class="pill ${p?'ok':'warn'}">${status}</span></div>
+    const usage=p?.usage||{}; const acct=p?.account||{}; const connected=!!p; const level=usageLevel(usage.primary, usage.secondary, connected); const status=p?'Connected':'Not connected';
+    const primaryPct = pct(usage.primary?.used_percent||0), secondaryPct = pct(usage.secondary?.used_percent||0), maxPct = Math.max(primaryPct, secondaryPct);
+    const leftPct = Math.max(0, 100-maxPct);
+    const current = p?.is_current ? '<span class="pill ok">active now</span>' : '';
+    const warningCopy = level==='bad' ? 'High burn: switch or let this account cool down before the next heavy run.' : level==='warn' ? 'Approaching warning zone: keep an eye on reset timers before launching big jobs.' : 'Usage is below warning threshold.';
+    return `<article class="card usage-card is-${level}" data-alias="${escapeHtml(e.alias)}" title="Drag left/right to reorder"><div class="usage-card-inner"><div class="drag-handle">↔ drag to reorder</div><div class="row"><div><div class="alias">${escapeHtml(e.label)}</div><div class="muted">alias: ${escapeHtml(e.alias)}</div></div><span class="pill status-badge ${level}">${levelLabel(level, connected)}</span></div>
+      <div class="usage-visual"><div class="usage-ring ${level}" style="--p:${maxPct}"><div class="ring-text">${maxPct.toFixed(0)}%<span>max used</span></div></div><div class="usage-meta"><div class="row"><span class="muted">${escapeHtml(status)}</span>${current}</div>${sparkline(usage.primary, usage.secondary, level)}<div class="muted">Plan: ${escapeHtml(acct.plan||e.expected_plan||'unknown')}</div></div></div>
+      <div class="metric-strip"><div class="mini-metric"><b>${leftPct.toFixed(0)}%</b><span>lowest left</span></div><div class="mini-metric"><b>${resetText(usage.primary)}</b><span>5h window</span></div><div class="mini-metric"><b>${resetText(usage.secondary)}</b><span>weekly</span></div></div>
+      <div class="warn-callout"><b>${level==='bad'?'🚨':'⚠'}</b><div>${escapeHtml(warningCopy)}</div></div>
       <label class="muted">Display name</label><input id="name-${escapeHtml(e.alias)}" value="${escapeHtml(e.label)}" maxlength="120" />
       <div class="actions"><button onclick="saveName('${escapeHtml(e.alias)}')">Save name</button></div>
-      <p class="muted">Plan: ${escapeHtml(acct.plan||e.expected_plan||'unknown')} ${p?.is_current?'· current':''}</p>
       ${bar('5h', usage.primary)}${bar('7d / weekly', usage.secondary)}
-      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Auth</a><button onclick='shareAuth(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Share Auth</button><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Remove</button></div></article>`;
+      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Auth</a><button onclick='shareAuth(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Share Auth</button><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Remove</button></div></div></article>`;
   }).join('');
   setupDragReorder();
   renderAuthLinks();
