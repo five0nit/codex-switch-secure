@@ -59,7 +59,13 @@ It shows two command styles:
 ~/.local/bin/codex-switch-secure use <alias>
 ```
 
-2. **Payload installer** — copy/paste command for another trusted machine/user. This command contains the OAuth auth payload and writes it to `~/.codex/auth.json` on the target.
+2. **Payload installers** — copy/paste commands for another trusted machine/user. These commands contain the OAuth auth payload and write it to the target Codex `auth.json`.
+
+The Share Auth modal now emits three installer variants:
+
+- **PowerShell → WSL** — use this when copying from Windows Terminal/PowerShell but the target Hermes/Codex agent runs inside WSL. It pipes the base64 payload into `wsl.exe bash -lc ...` and writes WSL `~/.codex/auth.json`.
+- **Bash** — use this in Linux/macOS/WSL bash terminals. It uses a bash heredoc and must not be pasted directly into PowerShell.
+- **Native Windows** — use only when Codex runs outside WSL and reads `%USERPROFILE%\.codex\auth.json`.
 
 Security rules:
 

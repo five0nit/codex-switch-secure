@@ -205,12 +205,26 @@ def build_share_auth(alias: str) -> dict:
     q_alias = shlex.quote(alias)
     q_bundle = shlex.quote(str(bundle_path))
     q_bin = shlex.quote(BIN)
-    payload_cmd = (
+    bash_payload_cmd = (
         "umask 077; mkdir -p ~/.codex; "
         "base64 -d > ~/.codex/auth.json <<'AUTH_PAYLOAD'\n"
         f"{b64}\n"
         "AUTH_PAYLOAD\n"
         "chmod 600 ~/.codex/auth.json"
+    )
+    powershell_wsl_payload_cmd = (
+        "$payload = @'\n"
+        f"{b64}\n"
+        "'@\n"
+        "$payload | wsl.exe bash -lc 'umask 077; mkdir -p ~/.codex; base64 -d > ~/.codex/auth.json; chmod 600 ~/.codex/auth.json'"
+    )
+    powershell_windows_payload_cmd = (
+        "$payload = @'\n"
+        f"{b64}\n"
+        "'@\n"
+        "$dir = \"$HOME\\.codex\"\n"
+        "New-Item -ItemType Directory -Force $dir | Out-Null\n"
+        "[IO.File]::WriteAllBytes(\"$dir\\auth.json\", [Convert]::FromBase64String($payload))"
     )
     return {
         "ok": True,
@@ -219,7 +233,11 @@ def build_share_auth(alias: str) -> dict:
         "warning": "Sensitive OAuth auth payload. Only paste/share with your own trusted agent machine. Rotate/re-auth if exposed.",
         "same_machine_switch_command": f"{q_bin} use {q_alias}",
         "same_machine_install_command": f"umask 077; mkdir -p ~/.codex; install -m 600 {q_bundle} ~/.codex/auth.json",
-        "target_machine_payload_install_command": payload_cmd,
+        # Backwards-compatible field. Default to the PowerShell->WSL installer because Mike often copies from Windows Terminal/PowerShell into WSL-backed Hermes/Codex agents.
+        "target_machine_payload_install_command": powershell_wsl_payload_cmd,
+        "target_machine_powershell_wsl_install_command": powershell_wsl_payload_cmd,
+        "target_machine_bash_install_command": bash_payload_cmd,
+        "target_machine_powershell_windows_install_command": powershell_windows_payload_cmd,
         "target_machine_import_command_note": f"If you copy {bundle_path.name} to another machine, import it there with: {q_bin} import /path/to/{shlex.quote(bundle_path.name)} {q_alias}",
     }
 
@@ -792,9 +810,15 @@ INDEX_HTML = r"""
     <p class="muted">Fast local repoint on this same machine:</p>
     <textarea id="shareLocal" readonly></textarea>
     <div class="actions"><button onclick="copyText('shareLocal')">Copy local command</button></div>
-    <p class="muted">Copy/paste installer for another trusted machine. This contains the auth payload; do not paste into chats/logs.</p>
+    <p class="muted">PowerShell → WSL installer for Windows Terminal/PowerShell when Hermes/Codex runs inside WSL. This contains the auth payload; do not paste into chats/logs.</p>
     <textarea id="sharePayload" readonly></textarea>
-    <div class="actions"><button onclick="copyText('sharePayload')">Copy payload installer</button></div>
+    <div class="actions"><button onclick="copyText('sharePayload')">Copy PowerShell → WSL installer</button></div>
+    <p class="muted">Bash installer for Linux/macOS/WSL bash terminals:</p>
+    <textarea id="sharePayloadBash" readonly></textarea>
+    <div class="actions"><button onclick="copyText('sharePayloadBash')">Copy bash installer</button></div>
+    <p class="muted">Native Windows Codex installer, only if Codex runs outside WSL:</p>
+    <textarea id="sharePayloadWindows" readonly></textarea>
+    <div class="actions"><button onclick="copyText('sharePayloadWindows')">Copy native Windows installer</button></div>
     <p class="muted" id="shareBundle"></p>
   </div>
 </div>
@@ -875,7 +899,9 @@ async function shareAuth(alias, label){
   if(!res.ok){ alert(res.error || 'Share auth failed'); return; }
   document.getElementById('shareTitle').innerText = `Share auth: ${label || alias}`;
   document.getElementById('shareLocal').value = `${res.same_machine_switch_command}\n# If the target local agent only reads ~/.codex/auth.json, use:\n${res.same_machine_install_command}`;
-  document.getElementById('sharePayload').value = res.target_machine_payload_install_command;
+  document.getElementById('sharePayload').value = res.target_machine_powershell_wsl_install_command || res.target_machine_payload_install_command;
+  document.getElementById('sharePayloadBash').value = res.target_machine_bash_install_command || '';
+  document.getElementById('sharePayloadWindows').value = res.target_machine_powershell_windows_install_command || '';
   document.getElementById('shareBundle').innerText = `Local bundle written: ${res.bundle_path}\n${res.target_machine_import_command_note}`;
   document.getElementById('shareModal').classList.add('open');
 }
