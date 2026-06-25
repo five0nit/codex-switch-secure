@@ -1,3 +1,3 @@
-agent,machine,os,generated_at,current_account_alias,auth_fingerprint,tokens_24h,tokens_7d,thread_count_24h,thread_count_7d,last_used_at,rate_limit_errors_24h
-Tony-MacMini,mac-mini,macos,2026-06-24T13:00:00+10:00,pro-2,sha256:example,0,0,0,0,,0
-Backup-WSL-Desktop,wsl-desktop,wsl,2026-06-24T13:00:00+10:00,pro-1,sha256:example,0,0,0,0,,0
+agent,machine,os,generated_at,current_account_alias,auth_fingerprint,tokens_30m,tokens_1h,tokens_2h,tokens_3h,tokens_24h,tokens_7d,thread_count_24h,thread_count_7d,last_used_at,rate_limit_errors_24h
+Tony-MacMini,mac-mini,macos,2026-06-24T13:00:00+10:00,pro-2,sha256:example,0,0,0,0,0,0,0,0,,0
+Backup-WSL-Desktop,wsl-desktop,wsl,2026-06-24T13:00:00+10:00,pro-1,sha256:example,0,0,0,0,0,0,0,0,,0

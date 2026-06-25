@@ -273,7 +273,7 @@ def get_machine_usage(force: bool = False) -> dict:
     source = get_machine_usage_source()
     now = datetime.now(MELBOURNE_TZ)
     if not source:
-        return {"ok": True, "configured": False, "source": "google_sheet_csv", "rows": [], "totals": {"tokens_24h": 0, "tokens_7d": 0}, "message": "Set a published Google Sheet CSV URL first."}
+        return {"ok": True, "configured": False, "source": "google_sheet_csv", "rows": [], "totals": {"tokens_30m": 0, "tokens_1h": 0, "tokens_2h": 0, "tokens_3h": 0, "tokens_24h": 0, "tokens_7d": 0}, "message": "Set a published Google Sheet CSV URL first."}
 
     if not force and MACHINE_USAGE_CACHE.exists():
         try:
@@ -307,6 +307,10 @@ def get_machine_usage(force: bool = False) -> dict:
             "os": _row_value(raw, "os"),
             "current_account_alias": _row_value(raw, "current_account_alias", "account_alias", "alias"),
             "auth_fingerprint": _row_value(raw, "auth_fingerprint", "auth_hash")[:80],
+            "tokens_30m": _intish(_row_value(raw, "tokens_30m", "tokens_30min", "tokens_last_30m")),
+            "tokens_1h": _intish(_row_value(raw, "tokens_1h", "tokens_60m", "tokens_last_1h")),
+            "tokens_2h": _intish(_row_value(raw, "tokens_2h", "tokens_120m", "tokens_last_2h")),
+            "tokens_3h": _intish(_row_value(raw, "tokens_3h", "tokens_180m", "tokens_last_3h")),
             "tokens_24h": _intish(_row_value(raw, "tokens_24h", "tokens_1d")),
             "tokens_7d": _intish(_row_value(raw, "tokens_7d", "tokens_week")),
             "thread_count_24h": _intish(_row_value(raw, "thread_count_24h", "threads_24h")),
@@ -327,6 +331,10 @@ def get_machine_usage(force: bool = False) -> dict:
         "fetched_at": now.isoformat(),
         "row_count": len(rows),
         "totals": {
+            "tokens_30m": sum(r["tokens_30m"] for r in rows),
+            "tokens_1h": sum(r["tokens_1h"] for r in rows),
+            "tokens_2h": sum(r["tokens_2h"] for r in rows),
+            "tokens_3h": sum(r["tokens_3h"] for r in rows),
             "tokens_24h": sum(r["tokens_24h"] for r in rows),
             "tokens_7d": sum(r["tokens_7d"] for r in rows),
             "rate_limit_errors_24h": sum(r["rate_limit_errors_24h"] for r in rows),
@@ -759,6 +767,10 @@ INDEX_HTML = r"""
       <button onclick="saveMachineSheetUrl()">Save source</button>
       <button onclick="loadMachineUsage(true)">Refresh machine usage</button>
     </div>
+    <div class="row" style="align-items:flex-end; flex-wrap:wrap; margin-top:8px">
+      <label style="flex:1; min-width:260px"><span class="muted">Usage log filter</span><input id="machineUsageFilter" placeholder="Filter by agent, machine, account, OS, status…" oninput="renderMachineUsageTable()" /></label>
+      <button onclick="document.getElementById('machineUsageFilter').value=''; renderMachineUsageTable();">Clear filter</button>
+    </div>
     <div id="machineUsageSummary" style="margin-top:10px"></div>
     <div id="machineUsageRows"></div>
   </section>
@@ -766,6 +778,11 @@ INDEX_HTML = r"""
     <div class="alias">Auth setup links</div>
     <p class="muted">Open each local link below, then click the OpenAI device page and enter the displayed code. Use different browser profiles/incognito sessions if you need to keep accounts separate.</p>
     <div class="actions" id="authLinks"></div>
+    <hr style="border:0; border-top:1px solid var(--line); margin:16px 0" />
+    <div class="alias">Sharefile setup</div>
+    <p class="muted">Copy/paste this instruction into each agent/machine. It tells the agent how to access the shared Google Sheet and maintain its own row with a background cron job.</p>
+    <textarea id="sharefilePrompt" readonly style="min-height:360px"></textarea>
+    <div class="actions"><button onclick="copyText('sharefilePrompt')">Copy sharefile setup instruction</button><button onclick="renderSharefilePrompt()">Regenerate instruction</button></div>
   </section>
 </main>
 <div class="modal" id="shareModal">
@@ -783,6 +800,7 @@ INDEX_HTML = r"""
 </div>
 <script>
 let expected = [];
+let latestMachineUsageRows = [];
 function escapeHtml(s){ return String(s||'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
 function pct(n){ return Math.max(0, Math.min(100, Number(n||0))); }
 function fmtDate(ts){
@@ -930,14 +948,25 @@ async function saveMachineSheetUrl(){
 async function loadMachineUsage(force=false){
   const data = await api(`/api/machine-usage${force?'?force=1':''}`);
   if(data.sheet_csv_url) document.getElementById('machineSheetUrl').value = data.sheet_csv_url;
+  renderSharefilePrompt();
   const summary = document.getElementById('machineUsageSummary');
   const table = document.getElementById('machineUsageRows');
   if(!data.ok){ summary.innerHTML = `<div class="bad">${escapeHtml(data.error||'Machine usage load failed')}</div>`; table.innerHTML=''; return; }
   if(!data.configured){ summary.innerHTML = `<div class="muted">${escapeHtml(data.message||'Set a Google Sheet CSV URL first.')}</div>`; table.innerHTML=''; return; }
-  summary.innerHTML = `<div><span class="summary-number">${Number(data.totals?.tokens_24h||0).toLocaleString()}</span> tokens / 24h · ${Number(data.totals?.tokens_7d||0).toLocaleString()} / 7d · ${Number(data.row_count||0)} machines</div><div class="muted">Fetched: ${escapeHtml(data.fetched_at||'')} ${data.cache_hit?'· cached':''}</div>`;
-  const rows = data.rows || [];
-  if(!rows.length){ table.innerHTML = '<div class="muted">No machine rows found in the sheet.</div>'; return; }
-  table.innerHTML = `<table class="token-table"><thead><tr><th>Status</th><th>Agent</th><th>Machine</th><th>Account</th><th>24h tokens</th><th>7d tokens</th><th>Last used</th><th>Heartbeat age</th><th>Rate limits</th></tr></thead><tbody>${rows.map(r=>`<tr><td class="${escapeHtml(r.status||'')}">●</td><td>${escapeHtml(r.agent)}</td><td>${escapeHtml(r.machine)}<div class="muted">${escapeHtml(r.os||'')}</div></td><td>${escapeHtml(r.current_account_alias||'')}</td><td>${Number(r.tokens_24h||0).toLocaleString()}</td><td>${Number(r.tokens_7d||0).toLocaleString()}</td><td>${escapeHtml(r.last_used_at||'')}</td><td>${r.age_minutes==null?'unknown':`${r.age_minutes}m`}</td><td>${Number(r.rate_limit_errors_24h||0).toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
+  summary.innerHTML = `<div><span class="summary-number">${Number(data.totals?.tokens_30m||0).toLocaleString()}</span> tokens / 30m · ${Number(data.totals?.tokens_1h||0).toLocaleString()} / 1h · ${Number(data.totals?.tokens_2h||0).toLocaleString()} / 2h · ${Number(data.totals?.tokens_3h||0).toLocaleString()} / 3h</div><div class="muted">24h: ${Number(data.totals?.tokens_24h||0).toLocaleString()} · 7d: ${Number(data.totals?.tokens_7d||0).toLocaleString()} · ${Number(data.row_count||0)} machines · fetched: ${escapeHtml(data.fetched_at||'')} ${data.cache_hit?'· cached':''}</div>`;
+  latestMachineUsageRows = data.rows || [];
+  renderMachineUsageTable();
+}
+function renderMachineUsageTable(){
+  const table = document.getElementById('machineUsageRows');
+  if(!table) return;
+  const filter = String(document.getElementById('machineUsageFilter')?.value || '').toLowerCase().trim();
+  let rows = latestMachineUsageRows || [];
+  if(filter){
+    rows = rows.filter(r => [r.status,r.agent,r.machine,r.os,r.current_account_alias,r.last_used_at,r.generated_at].some(v => String(v||'').toLowerCase().includes(filter)));
+  }
+  if(!rows.length){ table.innerHTML = '<div class="muted">No machine rows match the current filter.</div>'; return; }
+  table.innerHTML = `<table class="token-table"><thead><tr><th>Status</th><th>Agent</th><th>Machine</th><th>Account</th><th>30m</th><th>1h</th><th>2h</th><th>3h</th><th>24h</th><th>7d</th><th>Last used</th><th>Heartbeat age</th><th>Rate limits</th></tr></thead><tbody>${rows.map(r=>`<tr><td class="${escapeHtml(r.status||'')}">●</td><td>${escapeHtml(r.agent)}</td><td>${escapeHtml(r.machine)}<div class="muted">${escapeHtml(r.os||'')}</div></td><td>${escapeHtml(r.current_account_alias||'')}</td><td>${Number(r.tokens_30m||0).toLocaleString()}</td><td>${Number(r.tokens_1h||0).toLocaleString()}</td><td>${Number(r.tokens_2h||0).toLocaleString()}</td><td>${Number(r.tokens_3h||0).toLocaleString()}</td><td>${Number(r.tokens_24h||0).toLocaleString()}</td><td>${Number(r.tokens_7d||0).toLocaleString()}</td><td>${escapeHtml(r.last_used_at||'')}</td><td>${r.age_minutes==null?'unknown':`${r.age_minutes}m`}</td><td>${Number(r.rate_limit_errors_24h||0).toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
 }
 async function refreshAll(){
   const data = await api('/api/accounts');
@@ -960,6 +989,75 @@ async function refreshAll(){
 }
 function renderAuthLinks(){
   document.getElementById('authLinks').innerHTML = expected.map(e=>`<a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Authorize ${escapeHtml(e.label)}</a>`).join('');
+  renderSharefilePrompt();
+}
+function sheetEditUrlFromCsv(csvUrl){
+  const m = String(csvUrl||'').match(/\/spreadsheets\/d\/([^/]+)/);
+  return m ? `https://docs.google.com/spreadsheets/d/${m[1]}/edit` : '';
+}
+function renderSharefilePrompt(){
+  const el = document.getElementById('sharefilePrompt');
+  if(!el) return;
+  const csvUrl = document.getElementById('machineSheetUrl')?.value?.trim() || '<PASTE_MACHINE_USAGE_CSV_URL_HERE>';
+  const sheetUrl = sheetEditUrlFromCsv(csvUrl) || '<PASTE_GOOGLE_SHEET_EDIT_URL_HERE>';
+  const cols = 'agent,machine,os,generated_at,current_account_alias,auth_fingerprint,tokens_30m,tokens_1h,tokens_2h,tokens_3h,tokens_24h,tokens_7d,thread_count_24h,thread_count_7d,last_used_at,rate_limit_errors_24h';
+  el.value = `You are setting up this machine/agent to report Codex usage into Mike's shared Google Sheet. Do this end-to-end: inspect local Codex state/logs, create a small updater script, schedule it as a background cron job, run it once, and verify the row appears/updates in the Sheet. Do not expose OAuth tokens, API keys, or raw auth.json contents in chat/logs.
+
+Shared usage Sheet:
+- Edit URL: ${sheetUrl}
+- CSV/read URL: ${csvUrl}
+- Tab name: machine_usage
+- Required header row: ${cols}
+
+Goal:
+- Maintain exactly one row for this machine/agent.
+- The row must be updated every 15 minutes by a background cron job.
+- If a row for this agent/machine already exists, update it in place; do not append duplicates.
+- If authentication is missing, use the Google account associated with this machine to authorize Sheets/Drive access, or ask Mike for the correct shared-file auth method.
+
+Row fields to write:
+1. agent: stable agent name, e.g. Tony-MacMini, Backup-WSL, generalist1, work-mac-codex.
+2. machine: hostname or stable machine label.
+3. os: macos, wsl, linux, windows, etc.
+4. generated_at: current ISO-8601 timestamp with timezone.
+5. current_account_alias: active Codex/OpenAI account alias if known; otherwise blank/unknown.
+6. auth_fingerprint: non-secret fingerprint only, e.g. sha256 of auth file prefix or active account label. Never write raw tokens.
+7. tokens_30m: locally observed Codex token total over the last 30 minutes. Use 0 if unavailable.
+8. tokens_1h: locally observed Codex token total over the last 1 hour. Use 0 if unavailable.
+9. tokens_2h: locally observed Codex token total over the last 2 hours. Use 0 if unavailable.
+10. tokens_3h: locally observed Codex token total over the last 3 hours. Use 0 if unavailable.
+11. tokens_24h: locally observed Codex token total over the last 24 hours. Use 0 if unavailable.
+12. tokens_7d: locally observed Codex token total over the last 7 days. Use 0 if unavailable.
+13. thread_count_24h: count of local Codex threads/sessions touched in last 24h.
+14. thread_count_7d: count of local Codex threads/sessions touched in last 7d.
+15. last_used_at: latest observed Codex thread/log activity timestamp.
+16. rate_limit_errors_24h: count of local rate-limit/quota errors in logs over last 24h.
+
+Preferred local data sources:
+- ~/.codex/state_*.sqlite for thread/token counters when present.
+- ~/.codex/logs, ~/.codex/*.log, Hermes/OpenClaw logs, or Codex CLI logs for rate-limit/quota strings.
+- ~/.codex/auth.json or ~/.codex-switch current profile only for a non-secret fingerprint/alias. Never print/copy token fields.
+
+Implementation requirements:
+- Write a script named something like codex_usage_sheet_update.py under a user-local scripts directory.
+- The script should be idempotent and safe to run repeatedly.
+- It must update this machine's row only.
+- It must fail loudly in its own log file but stay quiet in normal cron output.
+- Store local config separately with: sheet URL/id, tab name, agent name, machine label, auth method.
+- Schedule with cron/system scheduler every 15 minutes.
+- Run once immediately after installing, then read back the row from the Sheet or CSV URL to verify.
+
+Cron target:
+*/15 * * * * /usr/bin/env bash -lc 'python3 /path/to/codex_usage_sheet_update.py >> ~/.codex-switch/codex_usage_sheet_update.log 2>&1'
+
+Success criteria to report back:
+- Script path
+- Cron entry installed
+- Agent/machine row key used
+- One successful immediate run timestamp
+- Read-back evidence from the shared Sheet/CSV showing the updated row
+- Any limitations, e.g. token totals unavailable so 0 is reported
+`;
 }
 initTokenFilters(); refreshAll(); loadTokenUsage(); loadMachineUsage(); setInterval(refreshAll, 15000); setInterval(loadMachineUsage, 30000);
 </script>

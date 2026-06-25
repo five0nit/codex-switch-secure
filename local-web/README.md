@@ -117,7 +117,7 @@ Use **Option C** with one shared Google Sheet. The dashboard reads a CSV export/
 Template columns are in `local-web/google-sheet-template.csv`:
 
 ```csv
-agent,machine,os,generated_at,current_account_alias,auth_fingerprint,tokens_24h,tokens_7d,thread_count_24h,thread_count_7d,last_used_at,rate_limit_errors_24h
+agent,machine,os,generated_at,current_account_alias,auth_fingerprint,tokens_30m,tokens_1h,tokens_2h,tokens_3h,tokens_24h,tokens_7d,thread_count_24h,thread_count_7d,last_used_at,rate_limit_errors_24h
 ```
 
 Recommended sheet structure:
@@ -127,9 +127,12 @@ Recommended sheet structure:
 - Tab: `machine_usage`
 - One row per machine/agent.
 - Each machine updates only its own row every 15 minutes.
-- Dashboard scrapes the Sheet CSV every 30 minutes and caches the result locally.
+- Token windows include `tokens_30m`, `tokens_1h`, `tokens_2h`, `tokens_3h`, `tokens_24h`, and `tokens_7d` for granular short-term routing.
+- Dashboard scrapes the Sheet CSV every 30 minutes, caches the result locally, and provides a usage-log filter by agent, machine, account, OS, or status.
 
 Set the source from the dashboard's **Machine usage — Google Sheet** card, or programmatically:
+
+The **Auth setup links → Sharefile setup** box generates a copy/paste agent instruction for remote machines. It includes the Sheet edit/CSV URLs, required columns, local Codex data sources, cron schedule, security rules, and verification checklist for installing a 15-minute background updater job on each machine.
 
 ```bash
 curl -X POST http://localhost:8787/api/machine-usage/source \
