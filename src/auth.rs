@@ -13,7 +13,7 @@ pub(crate) const USER_AGENT: &str = "codex/0.2.0";
 pub(crate) const ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// Local security guard for Mike's fork.
+/// Local security guard for credential-handling builds.
 ///
 /// The upstream tool allows endpoint overrides through environment variables,
 /// which is useful for integration tests but dangerous on an operator machine:

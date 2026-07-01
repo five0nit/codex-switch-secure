@@ -72,16 +72,15 @@ struct GithubAsset {
 
 pub async fn check_for_update(force: bool) -> Result<Option<UpdateInfo>> {
     let _ = force;
-    // Mike's private fork intentionally disables runtime update checks.
-    // This binary handles OAuth credentials, so updates should be reviewed,
-    // tested, and rebuilt from source in the private repository instead of
+    // Runtime update checks are intentionally disabled in this credential-handling fork.
+    // Updates should be reviewed, tested, and rebuilt from source instead of
     // discovered or applied at runtime.
     Ok(None)
 }
 
 /// Check whether a newer dev release exists on GitHub.
 ///
-/// Disabled in Mike's private fork; see `check_for_update` for rationale.
+/// Disabled in this credential-handling fork; see `check_for_update` for rationale.
 pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
     Ok(None)
 }
@@ -89,17 +88,17 @@ pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
 pub async fn self_update(version: Option<&str>, show_progress: bool) -> Result<SelfUpdateResult> {
     let _ = (version, show_progress);
     anyhow::bail!(
-        "self-update is disabled in Mike's private security fork; update by pulling, reviewing, testing, and rebuilding from five0nit/codex-switch-secure"
+        "self-update is disabled in this credential-handling fork; update by pulling, reviewing, testing, and rebuilding from five0nit/codex-switch-secure"
     )
 }
 
 /// Install the dev build from the `dev` GitHub Release tag.
 ///
-/// Disabled in Mike's private fork; see `self_update` for rationale.
+/// Disabled in this credential-handling fork; see `self_update` for rationale.
 pub async fn self_update_dev(show_progress: bool) -> Result<SelfUpdateResult> {
     let _ = show_progress;
     anyhow::bail!(
-        "self-update is disabled in Mike's private security fork; update by pulling, reviewing, testing, and rebuilding from five0nit/codex-switch-secure"
+        "self-update is disabled in this credential-handling fork; update by pulling, reviewing, testing, and rebuilding from five0nit/codex-switch-secure"
     )
 }
 

@@ -18,4 +18,4 @@ The local web dashboard is intended to bind to `127.0.0.1` only. Do not expose i
 
 ## Reporting vulnerabilities
 
-If you find a vulnerability, open a private security advisory or contact the maintainer directly. Do not include secrets in the report; use redacted examples and safe fingerprints.
+If you find a vulnerability, open a GitHub security advisory or contact the maintainer directly. Do not include secrets in the report; use redacted examples and safe fingerprints.

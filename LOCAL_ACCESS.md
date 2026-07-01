@@ -1,19 +1,19 @@
-# Local access guide for Mike's codex-switch-secure fork
+# Local access guide
 
-This fork is intended to run **locally**, not as a hosted web service.
+This project is intended to run **locally**, not as a hosted public web service.
 
 ## Installed local binary
 
-A reviewed local build is installed at:
+A local source build can be installed at any path on your `PATH`, for example:
 
 ```bash
-~/.local/bin/codex-switch-secure
+~/.local/bin/codex-switch
 ```
 
 Check it with:
 
 ```bash
-~/.local/bin/codex-switch-secure --version
+codex-switch --version
 ```
 
 Expected repository line:
@@ -22,32 +22,41 @@ Expected repository line:
 https://github.com/five0nit/codex-switch-secure
 ```
 
-## Run the dashboard/TUI
+## First run
+
+Use the guided wizard:
 
 ```bash
-~/.local/bin/codex-switch-secure
+codex-switch setup
 ```
 
-or explicitly:
+For SSH/headless/WSL use:
 
 ```bash
-~/.local/bin/codex-switch-secure list
+codex-switch setup --device --alias main-pro
+```
+
+## Run the TUI or CLI dashboard
+
+```bash
+codex-switch list
+codex-switch tui
 ```
 
 ## Add/import accounts
 
-Use a throwaway/test Codex account first.
+Use a throwaway/test Codex account first if you are evaluating the tool.
 
 Interactive OAuth login:
 
 ```bash
-~/.local/bin/codex-switch-secure login test-account
+codex-switch login test-account
 ```
 
 Import an existing Codex `auth.json` backup:
 
 ```bash
-~/.local/bin/codex-switch-secure import /path/to/auth.json test-account
+codex-switch import /path/to/auth.json test-account
 ```
 
 ## Where data is stored
@@ -64,25 +73,22 @@ Codex's live auth file remains:
 ~/.codex/auth.json
 ```
 
-Never paste either file into chat.
+Never paste either file into chat, tickets, logs, screenshots, or GitHub issues.
 
 ## Update policy
 
-Runtime self-update is disabled. To update:
+Runtime self-update is disabled in this security-focused fork. To update from source:
 
 ```bash
-cd /home/fiv30nit/.openclaw/workspace/workspaces/codex-switch
 git fetch origin
 git status
 # review any changes before merging/pulling
 cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo audit
 cargo build --release --locked
-cp target/release/codex-switch ~/.local/bin/codex-switch-secure
-chmod 700 ~/.local/bin/codex-switch-secure
+cp target/release/codex-switch ~/.local/bin/codex-switch
+chmod 700 ~/.local/bin/codex-switch
 ```
 
 ## Local hosting note
 
-This specific project is a CLI/TUI account manager, not a browser-hosted dashboard. If Mike wants a browser page at `localhost:<port>`, build that as a separate local web dashboard that reads this tool's JSON output or uses Codex app-server directly.
+This project is primarily a CLI/TUI account manager. The optional `local-web/` dashboard should bind to localhost only and must not be exposed publicly without adding authentication.

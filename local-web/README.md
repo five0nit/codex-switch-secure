@@ -5,7 +5,7 @@ Local browser dashboard for `codex-switch`: account cards, usage windows, safe a
 ## Run
 
 ```bash
-cd /home/fiv30nit/.openclaw/workspace/workspaces/codex-switch
+cd /path/to/codex-switch-secure
 python3 local-web/server.py
 ```
 

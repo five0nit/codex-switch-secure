@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local-only web UI for Mike's codex-switch-secure fork.
+"""Local-only web UI for codex-switch.
 
 Binds to 127.0.0.1 only. It never displays OAuth tokens. Auth onboarding uses
 OpenAI's device-code flow through the reviewed local codex-switch-secure binary.
@@ -795,7 +795,7 @@ def build_share_auth(alias: str, default_model: str | None = None) -> dict:
         "warning": "Sensitive OAuth auth payload. Only paste/share with your own trusted agent machine. Rotate/re-auth if exposed.",
         "same_machine_switch_command": f"{q_bin} use {q_alias}",
         "same_machine_install_command": f"umask 077; mkdir -p ~/.codex; install -m 600 {q_bundle} ~/.codex/auth.json" + (f"; python3 - <<'PY_MODEL'\nfrom pathlib import Path\nimport json, re, os\nmodel = {clean_default_model!r}\npath = Path.home()/'.codex'/'config.toml'\ntext = path.read_text() if path.exists() else ''\nline = 'model = ' + json.dumps(model)\ntext = re.sub(r'(?m)^\\s*model\\s*=\\s*[\"\\\'][^\"\\\']*[\"\\\']\\s*$', line, text, count=1) if re.search(r'(?m)^\\s*model\\s*=\\s*[\"\\\'][^\"\\\']*[\"\\\']\\s*$', text) else line + '\\n' + text\npath.parent.mkdir(parents=True, exist_ok=True); path.write_text(text if text.endswith('\\n') else text+'\\n'); os.chmod(path,0o600)\nprint('Default Codex model set:', model)\nPY_MODEL" if clean_default_model else ""),
-        # Backwards-compatible field. Default to the PowerShell->WSL installer because Mike often copies from Windows Terminal/PowerShell into WSL-backed Hermes/Codex agents.
+        # Backwards-compatible field. Default to the PowerShell->WSL installer because Windows Terminal/PowerShell often targets WSL-backed Hermes/Codex agents.
         "target_machine_payload_install_command": powershell_wsl_payload_cmd,
         "target_machine_powershell_wsl_install_command": powershell_wsl_payload_cmd,
         "target_machine_bash_install_command": bash_payload_cmd,
@@ -2338,7 +2338,7 @@ function renderSharefilePrompt(){
   const csvUrl = document.getElementById('machineSheetUrl')?.value?.trim() || '<PASTE_MACHINE_USAGE_CSV_URL_HERE>';
   const sheetUrl = sheetEditUrlFromCsv(csvUrl) || '<PASTE_GOOGLE_SHEET_EDIT_URL_HERE>';
   const cols = 'agent,machine,os,generated_at,current_account_alias,auth_fingerprint,tokens_30m,tokens_1h,tokens_2h,tokens_3h,tokens_24h,tokens_7d,thread_count_24h,thread_count_7d,last_used_at,rate_limit_errors_24h';
-  el.value = `You are setting up this machine/agent to report Codex usage into Mike's shared Google Sheet. Do this end-to-end: inspect local Codex state/logs, create a small updater script, schedule it as a background cron job, run it once, and verify the row appears/updates in the Sheet. Do not expose OAuth tokens, API keys, or raw auth.json contents in chat/logs.
+  el.value = `You are setting up this machine/agent to report Codex usage into a shared Google Sheet. Do this end-to-end: inspect local Codex state/logs, create a small updater script, schedule it as a background cron job, run it once, and verify the row appears/updates in the Sheet. Do not expose OAuth tokens, API keys, or raw auth.json contents in chat/logs.
 
 Shared usage Sheet:
 - Edit URL: ${sheetUrl}
@@ -2350,7 +2350,7 @@ Goal:
 - Maintain exactly one row for this machine/agent.
 - The row must be updated every 15 minutes by a background cron job.
 - If a row for this agent/machine already exists, update it in place; do not append duplicates.
-- If authentication is missing, use the Google account associated with this machine to authorize Sheets/Drive access, or ask Mike for the correct shared-file auth method.
+- If authentication is missing, use the Google account associated with this machine to authorize Sheets/Drive access, or ask the sheet owner for the correct shared-file auth method.
 
 Row fields to write:
 1. agent: stable agent name, e.g. Tony-MacMini, Backup-WSL, generalist1, work-mac-codex.

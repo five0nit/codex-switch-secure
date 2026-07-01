@@ -1,4 +1,4 @@
-name: Release disabled in private fork
+name: Release disabled in credential-handling fork
 
 on:
   workflow_dispatch:
@@ -12,6 +12,6 @@ jobs:
     steps:
       - name: Release workflow intentionally disabled
         run: |
-          echo "Runtime self-update/release publishing is disabled in Mike's private security fork."
+          echo "Runtime self-update/release publishing is disabled in this credential-handling fork."
           echo "Build reviewed binaries from source after CI passes."
           exit 1
