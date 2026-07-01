@@ -2,6 +2,10 @@
 
 Local browser dashboard for `codex-switch`: account cards, usage windows, safe auth sharing for trusted machines, and local telemetry views.
 
+## Screenshot
+
+![Local web dashboard showing Codex account cards with plan labels, 5h and weekly usage windows, health status, Auth, Share Auth, and Refresh actions](../docs/web-dashboard.jpg)
+
 ## Run
 
 ```bash

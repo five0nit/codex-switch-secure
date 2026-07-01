@@ -6,6 +6,10 @@
 
 ---
 
+### Local web dashboard
+
+![Local web dashboard showing Codex account cards with plan labels, 5h and weekly usage windows, health status, Auth, Share Auth, and Refresh actions](docs/web-dashboard.jpg)
+
 ### TUI
 
 ![TUI](docs/tui.png)
