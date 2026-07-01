@@ -250,25 +250,25 @@ async fn setup_cmd(device: bool, alias: Option<&str>, yes: bool, skip_login: boo
     std::fs::create_dir_all(&profiles_dir)
         .with_context(|| format!("creating {}", profiles_dir.display()))?;
     println!(
-        "{} {}",
+        "{} Config directory: {}",
         color::success("[ok]"),
-        format!("Config directory: {}", app_dir.display())
+        app_dir.display()
     );
 
     let config_path = config::config_path()?;
     if config_path.exists() {
         println!(
-            "{} {}",
+            "{} Config already exists: {}",
             color::success("[ok]"),
-            format!("Config already exists: {}", config_path.display())
+            config_path.display()
         );
     } else {
         std::fs::write(&config_path, default_setup_config())
             .with_context(|| format!("writing {}", config_path.display()))?;
         println!(
-            "{} {}",
+            "{} Wrote starter config: {}",
             color::success("[ok]"),
-            format!("Wrote starter config: {}", config_path.display())
+            config_path.display()
         );
     }
 
