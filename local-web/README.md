@@ -56,7 +56,7 @@ It shows two command styles:
 1. **Same-machine repoint** — safest/fastest when the impacted Hermes/Codex agent runs as the same Linux user:
 
 ```bash
-~/.local/bin/codex-switch-secure use <alias>
+~/.local/bin/codex-switch use <alias>
 ```
 
 2. **Payload installers** — copy/paste commands for another trusted machine/user. These commands contain the OAuth auth payload and write it to the target Codex `auth.json`.
@@ -88,7 +88,7 @@ Every 30 minutes, Monday-Friday, 07:00-18:00 Australia/Melbourne time
 The scheduled refresher calls:
 
 ```bash
-~/.local/bin/codex-switch-secure --json list --force
+codex-switch --json list --force
 ```
 
 Manual refresh is also available from the dashboard button, and programmatically at:
@@ -183,6 +183,6 @@ http://localhost:8787/api/config
 ## Security notes
 
 - The web UI never displays access tokens, refresh tokens, or raw `auth.json`.
-- It shells out to the reviewed local binary: `~/.local/bin/codex-switch-secure`.
+- It shells out to the configured local binary (`codex-switch` on `PATH`, or `CODEX_SWITCH_BIN=/absolute/path/to/codex-switch`).
 - Login subprocesses use device-code flow and write profiles through codex-switch itself.
 - Do not expose this service beyond localhost.

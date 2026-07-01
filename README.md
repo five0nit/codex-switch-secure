@@ -299,6 +299,35 @@ codex-switch warmup <alias>
 - Never paste payloads into GitHub, Telegram, Discord, CI logs, or bug reports.
 - If a payload leaks, re-authorize/rotate that OpenAI account.
 
+## Web dashboard option
+
+Run the web dashboard when you want a visual view of all accounts, easier one-click auth switching on the current machine, or copy/paste Share Auth commands for another trusted machine.
+
+```bash
+# From a source checkout
+python3 local-web/server.py
+
+# If codex-switch is not on PATH, point the dashboard at it explicitly
+CODEX_SWITCH_BIN=/absolute/path/to/codex-switch python3 local-web/server.py
+```
+
+Then open:
+
+```text
+http://localhost:8787/
+```
+
+The dashboard binds to `127.0.0.1` only. It shows account cards, plan/usage windows, editable display names, refresh buttons, and **Share Auth** actions. Share Auth can generate:
+
+- a same-machine `codex-switch use <alias>` repoint command,
+- a Bash payload installer for Linux/macOS/WSL,
+- a PowerShell → WSL installer for Windows Terminal users targeting WSL, and
+- a native Windows installer for Codex running outside WSL.
+
+Those payload installers contain OAuth material. Treat them like passwords and only paste them into machines you trust.
+
+See [Local web UI](local-web/README.md) for the full dashboard guide.
+
 ## Commands
 
 | Command | Description |

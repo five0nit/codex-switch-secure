@@ -2,7 +2,7 @@
 """Local-only web UI for codex-switch.
 
 Binds to 127.0.0.1 only. It never displays OAuth tokens. Auth onboarding uses
-OpenAI's device-code flow through the reviewed local codex-switch-secure binary.
+OpenAI's device-code flow through the configured local codex-switch binary.
 Includes editable display names and a Melbourne-business-hours force refresher.
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -30,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("CODEX_SWITCH_WEB_PORT", "8787"))
-BIN = os.environ.get("CODEX_SWITCH_BIN", str(Path.home() / ".local/bin/codex-switch-secure"))
+BIN = os.environ.get("CODEX_SWITCH_BIN", "codex-switch")
 CONFIG_PATH = Path(os.environ.get("CODEX_SWITCH_WEB_CONFIG", str(Path.home() / ".codex-switch/local-web-config.json")))
 PROFILE_ROOT = Path(os.environ.get("CODEX_SWITCH_PROFILE_ROOT", str(Path.home() / ".codex-switch/profiles")))
 SHARE_DIR = Path(os.environ.get("CODEX_SWITCH_SHARE_DIR", str(Path.home() / ".codex-switch/share")))
@@ -2578,8 +2579,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not Path(BIN).exists():
+    if os.sep in BIN and not Path(BIN).exists():
         raise SystemExit(f"codex-switch binary not found: {BIN}")
+    if os.sep not in BIN and shutil.which(BIN) is None:
+        raise SystemExit(
+            f"codex-switch binary not found on PATH: {BIN}. "
+            "Install it or set CODEX_SWITCH_BIN=/absolute/path/to/codex-switch."
+        )
     load_config()
     threading.Thread(target=scheduler_loop, name="melbourne-refresh-scheduler", daemon=True).start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
