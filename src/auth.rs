@@ -42,9 +42,7 @@ pub fn codex_auth_path() -> Result<PathBuf> {
         // Reject path traversal components
         for component in path.components() {
             if matches!(component, std::path::Component::ParentDir) {
-                anyhow::bail!(
-                    "CODEX_HOME contains '..' component which is not allowed: {home}"
-                );
+                anyhow::bail!("CODEX_HOME contains '..' component which is not allowed: {home}");
             }
         }
         return Ok(path.join("auth.json"));

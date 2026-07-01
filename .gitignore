@@ -2,3 +2,6 @@
 /temp
 .claude/
 .AIINFO/
+__pycache__/
+*.pyc
+local-web/.hermes-tmp.*

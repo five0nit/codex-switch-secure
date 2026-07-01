@@ -24,7 +24,14 @@ pub fn base_response(
     used_7d: f64,
     reset_7d_in: i64,
 ) -> Value {
-    base_response_at(plan_type, used_5h, reset_5h_in, used_7d, reset_7d_in, now_unix())
+    base_response_at(
+        plan_type,
+        used_5h,
+        reset_5h_in,
+        used_7d,
+        reset_7d_in,
+        now_unix(),
+    )
 }
 
 /// Build a response with a specific `now` timestamp (for clock-consistent test scenarios).

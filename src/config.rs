@@ -296,5 +296,9 @@ pub fn daemon_log_level() -> String {
     };
     let probe: DaemonLogLevelProbe = toml::from_str(&content).unwrap_or_default();
     let trimmed = probe.daemon.log_level.trim().to_string();
-    if trimmed.is_empty() { "error".to_string() } else { trimmed }
+    if trimmed.is_empty() {
+        "error".to_string()
+    } else {
+        trimmed
+    }
 }

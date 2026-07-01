@@ -199,8 +199,7 @@ async fn daemon_start_switch_status_and_stop() {
             std::fs::read_to_string(env.current_file())
                 .map(|s| s.trim() == "gradual_b")
                 .unwrap_or(false)
-                && read_live_access_token(&env.live_auth_path()).as_deref()
-                    == Some("tok_gradual_b")
+                && read_live_access_token(&env.live_auth_path()).as_deref() == Some("tok_gradual_b")
         },
     );
 

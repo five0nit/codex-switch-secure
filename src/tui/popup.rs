@@ -76,11 +76,7 @@ pub fn render_popup(
 
     // Measure content
     let content_h = lines.len() as u16;
-    let content_w: u16 = lines
-        .iter()
-        .map(|l| l.width() as u16)
-        .max()
-        .unwrap_or(0);
+    let content_w: u16 = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
 
     let title_w = (title.len() as u16).saturating_add(4); // "─ title ─" + corners
     let needed_w = content_w.saturating_add(4).max(title_w); // 2 border + 2 padding
@@ -94,7 +90,12 @@ pub fn render_popup(
 
     let x = screen.x + screen.width.saturating_sub(w) / 2;
     let y = screen.y + screen.height.saturating_sub(h) / 2;
-    let area = Rect { x, y, width: w, height: h };
+    let area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     f.render_widget(Clear, area);
 

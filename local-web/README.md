@@ -1,6 +1,6 @@
 # Local web UI
 
-Local browser dashboard for Mike's private `codex-switch-secure` fork.
+Local browser dashboard for `codex-switch`: account cards, usage windows, safe auth sharing for trusted machines, and local telemetry views.
 
 ## Run
 
@@ -97,14 +97,22 @@ Manual refresh is also available from the dashboard button, and programmatically
 curl -X POST http://localhost:8787/api/refresh
 ```
 
-## Adding more accounts
+## Adding more auth
 
-Use the **Add account** card in the dashboard:
+Use the **Add auth** card in the dashboard:
 
-1. Enter a display name.
-2. Optionally enter an internal alias, e.g. `spare-pro-1`.
-3. Click **Add account**.
-4. The dashboard opens that account's auth page and starts the same OpenAI device-code flow.
+1. Choose provider:
+   - **OpenAI Codex OAuth** — existing device-code flow, unchanged.
+   - **Anthropic API key** — saves a local key entry to `~/.codex-switch/anthropic-accounts.json` with `chmod 600`.
+   - **Grok / xAI API key** — saves a local key entry to `~/.codex-switch/grok-accounts.json` with `chmod 600`.
+2. Enter a display name.
+3. Optionally enter an internal alias, e.g. `spare-pro-1`, `anthropic-admin`, or `xai-main`.
+4. For Codex, click **Add auth** and complete the OpenAI device-code auth page.
+5. For Anthropic/Grok, paste the full API key and click **Add auth**. The dashboard saves the key locally and refreshes the corresponding validation panel. Raw keys are never returned by the API response.
+
+Anthropic note: normal API key validation uses `/v1/models`; usage/cost numbers require Anthropic Admin Usage & Cost API access, so a valid normal key can still show admin blocked.
+
+Grok/xAI note: validation uses `https://api.x.ai/v1/models`; usage/spend/credit remain unavailable unless xAI exposes a public usage endpoint for the key.
 
 Device codes are valid for roughly 15 minutes. If a code fails or expires, the auth page now shows **Start a fresh auth code**; use that instead of trying to reuse the old code.
 

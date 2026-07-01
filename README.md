@@ -43,13 +43,13 @@
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/five0nit/codex-switch-secure/master/scripts/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/five0nit/codex-switch-secure/master/scripts/install.ps1 | iex
 ```
 
 ### Homebrew (macOS / Linux)
@@ -63,13 +63,13 @@ brew install xjoker/tap/codex-switch
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --dev
+curl -fsSL https://raw.githubusercontent.com/five0nit/codex-switch-secure/master/scripts/install.sh | bash -s -- --dev
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-$env:CS_DEV="1"; irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+$env:CS_DEV="1"; irm https://raw.githubusercontent.com/five0nit/codex-switch-secure/master/scripts/install.ps1 | iex
 ```
 
 ### Uninstall
@@ -77,18 +77,18 @@ $env:CS_DEV="1"; irm https://raw.githubusercontent.com/xjoker/codex-switch/maste
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/five0nit/codex-switch-secure/master/scripts/install.sh | bash -s -- --uninstall
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-$env:CS_UNINSTALL="1"; irm https://raw.githubusercontent.com/xjoker/codex-switch/master/scripts/install.ps1 | iex
+$env:CS_UNINSTALL="1"; irm https://raw.githubusercontent.com/five0nit/codex-switch-secure/master/scripts/install.ps1 | iex
 ```
 
 ### From GitHub Releases (Manual)
 
-Download pre-built binaries from [Releases](https://github.com/xjoker/codex-switch/releases):
+Download pre-built binaries from [Releases](https://github.com/five0nit/codex-switch-secure/releases):
 
 | Platform | Architecture | File |
 |----------|-------------|------|
@@ -104,14 +104,40 @@ Download pre-built binaries from [Releases](https://github.com/xjoker/codex-swit
 Requires [Rust](https://rustup.rs/) 1.88+:
 
 ```bash
-git clone https://github.com/xjoker/codex-switch.git
-cd codex-switch
+git clone https://github.com/five0nit/codex-switch-secure.git
+cd codex-switch-secure
 cargo build --release
 # Binary: target/release/codex-switch (or target\release\codex-switch.exe on Windows)
 sudo cp target/release/codex-switch /usr/local/bin/  # macOS/Linux
 ```
 
 ## Quick Start
+
+### Guided setup wizard (recommended)
+
+Run the wizard first so you don't accidentally mix accounts, skip config, or paste auth payloads into the wrong shell:
+
+```bash
+codex-switch setup
+```
+
+Headless server / SSH / WSL-safe setup:
+
+```bash
+codex-switch setup --device --alias work-pro
+```
+
+The wizard:
+
+- creates `~/.codex-switch/` and a starter `config.toml` if missing,
+- detects an existing `~/.codex/auth.json` and offers to save it as a managed profile,
+- starts browser or device-code OAuth login when no auth exists,
+- verifies with `codex-switch list`, and
+- prints safe next steps without exposing raw tokens.
+
+See [Setup Wizard Guide](docs/setup-wizard.md) for the no-footgun flow and troubleshooting.
+
+### Manual flow
 
 ```bash
 # 1. Log in to your first Codex account
@@ -148,10 +174,136 @@ codex-switch daemon start
 codex-switch self-update --check
 ```
 
+## Tutorial: how it works
+
+`codex-switch` is a small account router for Codex CLI. It keeps your saved accounts in one local profile store, checks each account's current quota window, and can switch or launch Codex with the best available account.
+
+### The mental model
+
+| Piece | Location | What it does |
+|---|---|---|
+| Live Codex auth | `~/.codex/auth.json` | The auth file Codex CLI reads when it starts. Only one account is active here at a time. |
+| Saved profiles | `~/.codex-switch/profiles/<alias>/auth.json` | Private copies of each account's Codex OAuth payload. |
+| Active profile marker | `~/.codex-switch/current` | Records which profile `codex-switch use` selected last. |
+| Config | `~/.codex-switch/config.toml` | Non-secret behavior settings: cache TTL, proxy, scoring preferences, daemon options. |
+| Usage cache | `~/.codex-switch/cache.json` | Short-lived quota results so the tool does not hammer the usage endpoint. |
+
+The tool does **not** invent new OpenAI credentials. It organizes Codex OAuth auth files you already own and refreshes them through OpenAI's normal token refresh path.
+
+### First install, no footguns
+
+1. Install the binary:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/five0nit/codex-switch-secure/master/scripts/install.sh | bash
+   ```
+
+2. Run the setup wizard:
+
+   ```bash
+   codex-switch setup
+   ```
+
+   If you're on SSH, WSL, a server, or a browser might be logged into the wrong OpenAI account, use device-code login:
+
+   ```bash
+   codex-switch setup --device --alias main-pro
+   ```
+
+3. Confirm the account appears and usage can be fetched:
+
+   ```bash
+   codex-switch list
+   ```
+
+4. Add another account when you have one:
+
+   ```bash
+   codex-switch login --device spare-pro
+   codex-switch list --force
+   ```
+
+5. Before starting work, let the tool choose the best available account:
+
+   ```bash
+   codex-switch use
+   codex
+   ```
+
+   Or launch Codex through the safer wrapper:
+
+   ```bash
+   codex-switch launch -- --model gpt-5
+   ```
+
+### What happens when you run `codex-switch use`
+
+1. Reads every saved profile under `~/.codex-switch/profiles/`.
+2. Fetches or reuses cached usage for each account.
+3. Scores accounts by 5h usage, 7d usage, reset timing, plan type, and recent use.
+4. Copies the chosen profile's `auth.json` into `~/.codex/auth.json`.
+5. Updates `~/.codex-switch/current`.
+
+After that, a normal `codex` command starts with the selected account.
+
+### What happens when you run `codex-switch launch`
+
+`launch` is for people who do not want their live `~/.codex/auth.json` permanently changed:
+
+1. Selects the requested alias, or the best available account if you omit it.
+2. Temporarily stages that profile into `~/.codex/auth.json`.
+3. Starts Codex with your forwarded args.
+4. Restores the previous live auth file after startup.
+
+Example:
+
+```bash
+codex-switch launch spare-pro -- --model gpt-5 --approval-mode suggest
+```
+
+### Understanding the usage display
+
+`codex-switch list` shows quota windows from OpenAI's Codex usage endpoint:
+
+- `5h` / primary window: short rolling session quota.
+- `7d` / weekly window: longer rolling weekly quota.
+- Spark/model-specific windows may appear separately when OpenAI exposes `additional_rate_limits`.
+- Usage percentages are allowance/quota windows, not an all-time billing ledger.
+
+Use `--force` when you want fresh data instead of the short-lived cache:
+
+```bash
+codex-switch list --force
+```
+
+### Recommended daily workflow
+
+```bash
+# Start of day / before a big Codex session
+codex-switch list --force
+codex-switch use
+codex
+
+# If you want temporary account selection instead of changing live auth
+codex-switch launch -- --model gpt-5
+
+# If a fresh account has no reset timers yet
+codex-switch warmup <alias>
+```
+
+### Safety checklist before sharing auth between machines
+
+- Treat Share Auth payload installers like passwords.
+- Only paste payload installers into machines/users you trust.
+- Prefer the generated Bash installer in Linux/macOS/WSL shells and the PowerShell → WSL installer from Windows Terminal into WSL.
+- Never paste payloads into GitHub, Telegram, Discord, CI logs, or bug reports.
+- If a payload leaks, re-authorize/rotate that OpenAI account.
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
+| `codex-switch setup [--device] [--alias <name>] [--yes] [--skip-login]` | Guided first-run wizard: creates starter config, captures existing auth or starts login, verifies usage, and prints safe next steps |
 | `codex-switch use [alias] [--force]` | Switch to a profile. Omit alias to auto-select with the adaptive scoring algorithm. `--force` skips the running-process warning |
 | `codex-switch list [-f]` | List all profiles with account info, usage, and availability (`-f` force refresh) |
 | `codex-switch launch [alias] [-- args...]` | Launch Codex CLI with a profile's auth. Omit alias to auto-select with adaptive scoring. All arguments after `--` are forwarded to codex |

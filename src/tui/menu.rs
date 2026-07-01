@@ -33,15 +33,9 @@ pub enum MenuState {
         popup: PopupState,
     },
     /// Batch menu shown when one or more accounts are marked.
-    Batch {
-        count: usize,
-        popup: PopupState,
-    },
+    Batch { count: usize, popup: PopupState },
     /// Batch re-login flow chooser (browser vs device code).
-    BatchReloginFlow {
-        count: usize,
-        popup: PopupState,
-    },
+    BatchReloginFlow { count: usize, popup: PopupState },
 }
 
 #[derive(Debug, Clone)]
@@ -184,38 +178,44 @@ impl MenuState {
                 };
                 lines.push(Line::from(Span::styled(header, header_style)));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("u", "Use (switch to)"),
-                    ("l", "re-Login"),
-                    ("n", "reName"),
-                    ("w", "Warmup"),
-                    ("f", "reFresh this one"),
-                    ("d", "Delete"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[
+                        ("u", "Use (switch to)"),
+                        ("l", "re-Login"),
+                        ("n", "reName"),
+                        ("w", "Warmup"),
+                        ("f", "reFresh this one"),
+                        ("d", "Delete"),
+                    ],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "esc / q to cancel",
-                    dim,
-                )));
+                lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, title, &lines, popup, area);
             }
             MenuState::Add { popup } => {
                 let title = "Add new account";
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                lines.push(Line::from(Span::styled(
-                    "Choose OAuth flow:",
-                    header_style,
-                )));
+                lines.push(Line::from(Span::styled("Choose OAuth flow:", header_style)));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("b", "Browser (PKCE, opens local callback)"),
-                    ("d", "Device code (for headless / no browser)"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[
+                        ("b", "Browser (PKCE, opens local callback)"),
+                        ("d", "Device code (for headless / no browser)"),
+                    ],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, title, &lines, popup, area);
             }
-            MenuState::ReloginFlow { alias, email, popup } => {
+            MenuState::ReloginFlow {
+                alias,
+                email,
+                popup,
+            } => {
                 let header = match email {
                     Some(e) => format!("{alias}  ({e})"),
                     None => alias.clone(),
@@ -223,15 +223,16 @@ impl MenuState {
                 let mut lines: Vec<Line<'static>> =
                     vec![Line::from(Span::styled(header, header_style))];
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Choose OAuth flow:",
-                    header_style,
-                )));
+                lines.push(Line::from(Span::styled("Choose OAuth flow:", header_style)));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("b", "Browser (PKCE, opens local callback)"),
-                    ("d", "Device code (for headless / no browser)"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[
+                        ("b", "Browser (PKCE, opens local callback)"),
+                        ("d", "Device code (for headless / no browser)"),
+                    ],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, "re-Login", &lines, popup, area);
@@ -242,12 +243,16 @@ impl MenuState {
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 lines.push(Line::from(Span::styled(header, header_style)));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("r", "Refresh selected"),
-                    ("w", "Warmup selected"),
-                    ("l", "re-Login selected (sequential)"),
-                    ("d", "Delete selected"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[
+                        ("r", "Refresh selected"),
+                        ("w", "Warmup selected"),
+                        ("l", "re-Login selected (sequential)"),
+                        ("d", "Delete selected"),
+                    ],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, title, &lines, popup, area);
@@ -264,10 +269,11 @@ impl MenuState {
                     Style::default().fg(DIM),
                 )));
                 lines.push(Line::from(""));
-                lines.extend(menu_items(&[
-                    ("b", "Browser (PKCE)"),
-                    ("d", "Device code"),
-                ], key_style, label_style));
+                lines.extend(menu_items(
+                    &[("b", "Browser (PKCE)"), ("d", "Device code")],
+                    key_style,
+                    label_style,
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
                 render_popup(f, "Batch re-Login", &lines, popup, area);
@@ -276,12 +282,12 @@ impl MenuState {
     }
 }
 
-fn menu_items(
-    items: &[(&str, &str)],
-    key_style: Style,
-    label_style: Style,
-) -> Vec<Line<'static>> {
-    let key_w = items.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(1);
+fn menu_items(items: &[(&str, &str)], key_style: Style, label_style: Style) -> Vec<Line<'static>> {
+    let key_w = items
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(1);
     items
         .iter()
         .map(|(k, label)| {

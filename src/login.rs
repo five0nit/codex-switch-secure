@@ -432,7 +432,10 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
                 // aborting the device flow after the first poll.
                 _ if msg_lower.contains("authorization is pending")
                     || msg_lower.contains("authorization pending")
-                    || msg_lower.contains("please try again") => continue,
+                    || msg_lower.contains("please try again") =>
+                {
+                    continue;
+                }
                 "slow_down" => {
                     interval_secs = interval_secs.saturating_add(5);
                     continue;

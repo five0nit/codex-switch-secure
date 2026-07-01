@@ -31,6 +31,16 @@ pub struct JsonWindow {
 }
 
 #[derive(Serialize)]
+pub struct JsonCodexSparkUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metered_feature: Option<String>,
+    pub primary: Option<Box<JsonWindow>>,
+    pub secondary: Option<Box<JsonWindow>>,
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
 pub enum JsonUsage {
     Ok {
@@ -41,6 +51,8 @@ pub enum JsonUsage {
         credits_balance: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         unlimited_credits: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spark_usage: Option<JsonCodexSparkUsage>,
     },
     Err {
         error: String,
@@ -142,6 +154,21 @@ fn window_to_json(w: &WindowUsage, label: &str, window_secs: i64) -> JsonWindow 
     }
 }
 
+fn codex_spark_to_json(spark: &crate::usage::CodexSparkUsageInfo) -> JsonCodexSparkUsage {
+    JsonCodexSparkUsage {
+        limit_name: spark.limit_name.clone(),
+        metered_feature: spark.metered_feature.clone(),
+        primary: spark
+            .primary
+            .as_ref()
+            .map(|w| Box::new(window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS))),
+        secondary: spark
+            .secondary
+            .as_ref()
+            .map(|w| Box::new(window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS))),
+    }
+}
+
 pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
     match result {
         Err(e) => JsonUsage::Err {
@@ -152,6 +179,7 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                 .fetched_at
                 .map(format_iso8601)
                 .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+            let spark_usage = u.spark_usage.as_ref().map(codex_spark_to_json);
             JsonUsage::Ok {
                 fetched_at,
                 primary: u
@@ -164,6 +192,7 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                     .map(|w| Box::new(window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS))),
                 credits_balance: u.credits_balance,
                 unlimited_credits: u.unlimited_credits,
+                spark_usage,
             }
         }
     }

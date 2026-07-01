@@ -54,7 +54,6 @@ pub const KEYMAP: &[Binding] = &[
         label: "cycle sort (name / quota / status)",
         in_status_bar: false,
     },
-
     // Selection
     Binding {
         keys: "space",
@@ -68,7 +67,6 @@ pub const KEYMAP: &[Binding] = &[
         label: "clear marks / search / popup",
         in_status_bar: false,
     },
-
     // Account actions (via Enter menu)
     Binding {
         keys: "u",
@@ -106,7 +104,6 @@ pub const KEYMAP: &[Binding] = &[
         label: "delete",
         in_status_bar: false,
     },
-
     // Batch actions
     Binding {
         keys: "r",
@@ -132,7 +129,6 @@ pub const KEYMAP: &[Binding] = &[
         label: "delete selected",
         in_status_bar: false,
     },
-
     // Global
     Binding {
         keys: "enter",

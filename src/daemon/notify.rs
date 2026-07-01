@@ -14,9 +14,7 @@ pub fn send_notification(message: &str) {
         let _ = std::process::Command::new("osascript")
             .args([
                 "-e",
-                &format!(
-                    "display notification \"{escaped}\" with title \"codex-switch\""
-                ),
+                &format!("display notification \"{escaped}\" with title \"codex-switch\""),
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

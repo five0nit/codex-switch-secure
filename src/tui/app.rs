@@ -13,7 +13,7 @@ use crate::jwt::AccountInfo;
 use crate::login;
 use crate::profile::{
     self, cmd_delete, list_profiles, profile_auth_path, read_current, rename_profile,
-    sync_current_from_live, switch_profile, validate_alias,
+    switch_profile, sync_current_from_live, validate_alias,
 };
 use crate::usage::{UsageError, UsageInfo, fetch_usage_retried, fetch_usage_retried_force};
 
@@ -757,7 +757,10 @@ impl App {
         let candidate = target_indices.len();
         let (count, _, skipped) = self.warmup_indices(target_indices);
         if count == 0 {
-            self.set_status(format!("All {candidate} marked already active or skipped"), 4);
+            self.set_status(
+                format!("All {candidate} marked already active or skipped"),
+                4,
+            );
         } else {
             let mut msg = format!("Warming up {count} marked account(s)");
             if skipped > 0 {
@@ -812,12 +815,11 @@ impl App {
                 }
                 return false;
             }
-            KeyCode::Backspace
-                if state.cursor > 0 => {
-                    state.cursor -= 1;
-                    let byte_pos = char_to_byte(&state.input, state.cursor);
-                    state.input.remove(byte_pos);
-                }
+            KeyCode::Backspace if state.cursor > 0 => {
+                state.cursor -= 1;
+                let byte_pos = char_to_byte(&state.input, state.cursor);
+                state.input.remove(byte_pos);
+            }
             KeyCode::Delete => {
                 let char_count = state.input.chars().count();
                 if state.cursor < char_count {
@@ -825,10 +827,9 @@ impl App {
                     state.input.remove(byte_pos);
                 }
             }
-            KeyCode::Left
-                if state.cursor > 0 => {
-                    state.cursor -= 1;
-                }
+            KeyCode::Left if state.cursor > 0 => {
+                state.cursor -= 1;
+            }
             KeyCode::Right => {
                 let char_count = state.input.chars().count();
                 if state.cursor < char_count {
@@ -868,12 +869,11 @@ impl App {
                 KeyCode::Enter => {
                     accept_search = true;
                 }
-                KeyCode::Backspace
-                    if state.cursor > 0 => {
-                        state.cursor -= 1;
-                        let byte_pos = char_to_byte(&state.query, state.cursor);
-                        state.query.remove(byte_pos);
-                    }
+                KeyCode::Backspace if state.cursor > 0 => {
+                    state.cursor -= 1;
+                    let byte_pos = char_to_byte(&state.query, state.cursor);
+                    state.query.remove(byte_pos);
+                }
                 KeyCode::Delete => {
                     let char_count = state.query.chars().count();
                     if state.cursor < char_count {
@@ -881,10 +881,9 @@ impl App {
                         state.query.remove(byte_pos);
                     }
                 }
-                KeyCode::Left
-                    if state.cursor > 0 => {
-                        state.cursor -= 1;
-                    }
+                KeyCode::Left if state.cursor > 0 => {
+                    state.cursor -= 1;
+                }
                 KeyCode::Right => {
                     let char_count = state.query.chars().count();
                     if state.cursor < char_count {
@@ -1109,9 +1108,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             // Normalize letter case for top-level dispatch:
             // any uppercase letter is treated as its lowercase equivalent.
             let code = match key.code {
-                KeyCode::Char(c) if c.is_ascii_uppercase() => {
-                    KeyCode::Char(c.to_ascii_lowercase())
-                }
+                KeyCode::Char(c) if c.is_ascii_uppercase() => KeyCode::Char(c.to_ascii_lowercase()),
                 other => other,
             };
 
@@ -1145,14 +1142,12 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         app.clear_marks();
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j')
-                    if app.selected + 1 < app.view_indices.len() => {
-                        app.selected += 1;
-                    }
-                KeyCode::Up | KeyCode::Char('k')
-                    if app.selected > 0 => {
-                        app.selected -= 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j') if app.selected + 1 < app.view_indices.len() => {
+                    app.selected += 1;
+                }
+                KeyCode::Up | KeyCode::Char('k') if app.selected > 0 => {
+                    app.selected -= 1;
+                }
                 KeyCode::Enter => {
                     if app.marked.is_empty() {
                         app.open_account_menu();
@@ -1187,7 +1182,9 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
 }
 
 async fn handle_menu_key(app: &mut App, terminal: &mut DefaultTerminal, code: KeyCode) {
-    let Some(menu) = app.menu.as_ref() else { return };
+    let Some(menu) = app.menu.as_ref() else {
+        return;
+    };
     let action = menu.handle_key(code);
     use super::menu::MenuAction;
     match action {
@@ -1364,10 +1361,7 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     }
 
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    println!(
-        "\n=== Batch complete: {ok} ok, {} failed ===",
-        failed.len()
-    );
+    println!("\n=== Batch complete: {ok} ok, {} failed ===", failed.len());
     if !failed.is_empty() {
         for (a, e) in &failed {
             println!("  - {a}: {e}");

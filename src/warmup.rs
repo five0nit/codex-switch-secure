@@ -205,11 +205,10 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 *MODEL_CACHE.lock().await = None;
                 let new_model = resolve_model(&client, &access_token).await;
                 let retry_body = build_body(&new_model);
-                let mut retry_resp =
-                    make_request(&client, &access_token, &account_id, &retry_body)
-                        .send()
-                        .await
-                        .map_err(|e| crate::auth::format_reqwest_error("warmup retry failed", &e))?;
+                let mut retry_resp = make_request(&client, &access_token, &account_id, &retry_body)
+                    .send()
+                    .await
+                    .map_err(|e| crate::auth::format_reqwest_error("warmup retry failed", &e))?;
                 let retry_status = retry_resp.status();
                 if retry_status.is_success() {
                     let _ = retry_resp.chunk().await;

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
-use crate::usage::UsageInfo;
+use crate::usage::{CodexSparkUsageInfo, UsageInfo, WindowUsage};
 
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -24,6 +24,18 @@ struct CacheEntry {
     unlimited_credits: Option<bool>,
     #[serde(default)]
     plan_type: Option<String>,
+    #[serde(default)]
+    spark_limit_name: Option<String>,
+    #[serde(default)]
+    spark_metered_feature: Option<String>,
+    #[serde(default)]
+    spark_primary_used: Option<f64>,
+    #[serde(default)]
+    spark_primary_reset: Option<i64>,
+    #[serde(default)]
+    spark_secondary_used: Option<f64>,
+    #[serde(default)]
+    spark_secondary_reset: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -79,6 +91,7 @@ fn save_cache(cache: &CacheFile) -> Result<()> {
 }
 
 fn to_entry(u: &UsageInfo) -> CacheEntry {
+    let spark = u.spark_usage.as_ref();
     CacheEntry {
         ts: now_secs(),
         primary_used: u.primary.as_ref().and_then(|w| w.used_percent),
@@ -88,11 +101,24 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         credits_balance: u.credits_balance,
         unlimited_credits: u.unlimited_credits,
         plan_type: u.plan_type.clone(),
+        spark_limit_name: spark.and_then(|s| s.limit_name.clone()),
+        spark_metered_feature: spark.and_then(|s| s.metered_feature.clone()),
+        spark_primary_used: spark
+            .and_then(|s| s.primary.as_ref())
+            .and_then(|w| w.used_percent),
+        spark_primary_reset: spark
+            .and_then(|s| s.primary.as_ref())
+            .and_then(|w| w.resets_at),
+        spark_secondary_used: spark
+            .and_then(|s| s.secondary.as_ref())
+            .and_then(|w| w.used_percent),
+        spark_secondary_reset: spark
+            .and_then(|s| s.secondary.as_ref())
+            .and_then(|w| w.resets_at),
     }
 }
 
 fn from_entry(e: &CacheEntry) -> UsageInfo {
-    use crate::usage::WindowUsage;
     let primary = if e.primary_used.is_some() || e.primary_reset.is_some() {
         Some(WindowUsage {
             used_percent: e.primary_used,
@@ -109,6 +135,32 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
     } else {
         None
     };
+    let spark_primary = if e.spark_primary_used.is_some() || e.spark_primary_reset.is_some() {
+        Some(WindowUsage {
+            used_percent: e.spark_primary_used,
+            resets_at: e.spark_primary_reset,
+        })
+    } else {
+        None
+    };
+    let spark_secondary = if e.spark_secondary_used.is_some() || e.spark_secondary_reset.is_some() {
+        Some(WindowUsage {
+            used_percent: e.spark_secondary_used,
+            resets_at: e.spark_secondary_reset,
+        })
+    } else {
+        None
+    };
+    let spark_usage = if spark_primary.is_some() || spark_secondary.is_some() {
+        Some(CodexSparkUsageInfo {
+            limit_name: e.spark_limit_name.clone(),
+            metered_feature: e.spark_metered_feature.clone(),
+            primary: spark_primary,
+            secondary: spark_secondary,
+        })
+    } else {
+        None
+    };
     UsageInfo {
         fetched_at: Some(e.ts as i64),
         primary,
@@ -116,6 +168,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         credits_balance: e.credits_balance,
         unlimited_credits: e.unlimited_credits,
         plan_type: e.plan_type.clone(),
+        spark_usage,
     }
 }
 

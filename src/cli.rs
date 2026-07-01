@@ -70,6 +70,27 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Guided first-run setup: create config, log in/import first accounts, verify usage, and show safe next steps
+    #[command(
+        after_help = "Examples:\n  codex-switch setup\n  codex-switch setup --device\n  codex-switch setup --alias work-pro\n  codex-switch setup --yes --skip-login\n\nThe wizard never prints raw tokens and never deletes or overwrites a saved profile without asking."
+    )]
+    Setup {
+        /// Use device-code login instead of opening a browser
+        #[arg(long)]
+        device: bool,
+
+        /// Suggested alias for the first login/profile
+        #[arg(long)]
+        alias: Option<String>,
+
+        /// Accept safe defaults for non-destructive setup steps
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Do not start OAuth login; only inspect/create directories/config and print next steps
+        #[arg(long)]
+        skip_login: bool,
+    },
     /// Switch to a profile; omit alias to auto-select using the unified scoring algorithm
     Use {
         /// Profile alias (omit to auto-select)

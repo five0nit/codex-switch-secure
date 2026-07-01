@@ -15,6 +15,14 @@ pub struct WindowUsage {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct CodexSparkUsageInfo {
+    pub limit_name: Option<String>,
+    pub metered_feature: Option<String>,
+    pub primary: Option<WindowUsage>,
+    pub secondary: Option<WindowUsage>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct UsageInfo {
     pub fetched_at: Option<i64>,
     pub primary: Option<WindowUsage>,   // 5h window
@@ -23,6 +31,9 @@ pub struct UsageInfo {
     pub unlimited_credits: Option<bool>,
     /// plan_type from usage API response (authoritative; overrides JWT claims when present)
     pub plan_type: Option<String>,
+    /// Additional model-specific usage surfaced by the API, currently used for
+    /// GPT-5.3-Codex-Spark allowance windows.
+    pub spark_usage: Option<CodexSparkUsageInfo>,
 }
 
 /// All data needed to score an account. Pure data, no I/O.
@@ -57,9 +68,17 @@ impl Candidate {
     ) -> Self {
         Self {
             alias,
-            used_5h: u.primary.as_ref().and_then(|w| w.used_percent).unwrap_or(0.0),
+            used_5h: u
+                .primary
+                .as_ref()
+                .and_then(|w| w.used_percent)
+                .unwrap_or(0.0),
             resets_at_5h: u.primary.as_ref().and_then(|w| w.resets_at),
-            used_7d: u.secondary.as_ref().and_then(|w| w.used_percent).unwrap_or(0.0),
+            used_7d: u
+                .secondary
+                .as_ref()
+                .and_then(|w| w.used_percent)
+                .unwrap_or(0.0),
             resets_at_7d: u.secondary.as_ref().and_then(|w| w.resets_at),
             has_5h_data: u.primary.is_some(),
             has_7d_data: u.secondary.is_some(),
@@ -75,12 +94,20 @@ impl Candidate {
 
     /// Reset-aware effective 5h usage: 0.0 if window has already reset.
     pub fn effective_used_5h(&self) -> f64 {
-        if self.resets_at_5h.is_some_and(|ts| ts <= self.now) { 0.0 } else { self.used_5h }
+        if self.resets_at_5h.is_some_and(|ts| ts <= self.now) {
+            0.0
+        } else {
+            self.used_5h
+        }
     }
 
     /// Reset-aware effective 7d usage: 0.0 if window has already reset.
     pub fn effective_used_7d(&self) -> f64 {
-        if self.resets_at_7d.is_some_and(|ts| ts <= self.now) { 0.0 } else { self.used_7d }
+        if self.resets_at_7d.is_some_and(|ts| ts <= self.now) {
+            0.0
+        } else {
+            self.used_7d
+        }
     }
 }
 
@@ -565,6 +592,40 @@ pub(crate) async fn do_refresh_token(
     }
 }
 
+fn parse_codex_spark_usage(body: &Value) -> Option<CodexSparkUsageInfo> {
+    let limits = body.get("additional_rate_limits")?.as_array()?;
+    for entry in limits {
+        let limit_name = entry
+            .get("limit_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let metered_feature = entry
+            .get("metered_feature")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let normalized = format!(
+            "{} {}",
+            limit_name.to_lowercase(),
+            metered_feature.to_lowercase()
+        );
+        if normalized.contains("spark") {
+            let rate = entry.get("rate_limit")?;
+            let primary = rate.get("primary_window").and_then(parse_window);
+            let secondary = rate.get("secondary_window").and_then(parse_window);
+            if primary.is_none() && secondary.is_none() {
+                continue;
+            }
+            return Some(CodexSparkUsageInfo {
+                limit_name: Some(limit_name.to_string()),
+                metered_feature: Some(metered_feature.to_string()),
+                primary,
+                secondary,
+            });
+        }
+    }
+    None
+}
+
 fn parse_window(val: &Value) -> Option<WindowUsage> {
     // Require used_percent to be present for meaningful scoring data.
     // A window with only resets_at but no used_percent would cause
@@ -594,31 +655,39 @@ pub fn is_available(u: &UsageInfo) -> bool {
     true
 }
 
-
 /// Eligibility check on a Candidate (reset-aware).
 pub fn is_candidate_eligible(c: &Candidate, safety_margin_7d: f64) -> bool {
     let used_5h = c.effective_used_5h();
     let used_7d = c.effective_used_7d();
 
     // Gate 1: 5h exhausted (and not past reset)
-    if used_5h >= 100.0 { return false; }
+    if used_5h >= 100.0 {
+        return false;
+    }
     // Gate 2: 7d exhausted (and not past reset)
-    if used_7d >= 100.0 { return false; }
+    if used_7d >= 100.0 {
+        return false;
+    }
     // Gate 3: 7d critically low and reset far away
     if c.has_7d_data {
         let remaining_7d = 100.0 - used_7d;
         let critical_pct = (safety_margin_7d * 0.25_f64).max(1.0);
         if remaining_7d < critical_pct {
-            let hours_to_reset = c.resets_at_7d
+            let hours_to_reset = c
+                .resets_at_7d
                 .map(|ts| ((ts - c.now) as f64 / 3600.0).max(0.0))
                 .unwrap_or(f64::MAX);
-            if hours_to_reset > 48.0 { return false; }
+            if hours_to_reset > 48.0 {
+                return false;
+            }
         }
     }
     // Gate 4: Free plan safety floor
     if c.is_free && c.has_5h_data {
         let remaining_5h = 100.0 - used_5h;
-        if remaining_5h < FREE_FLOOR_PCT { return false; }
+        if remaining_5h < FREE_FLOOR_PCT {
+            return false;
+        }
     }
     true
 }
@@ -642,7 +711,11 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     let used_7d = c.effective_used_7d();
 
     // ── Component A: tier_bonus (0 or 500) ──
-    let tier_bonus = if c.is_team && c.team_priority { 500.0 } else { 0.0 };
+    let tier_bonus = if c.is_team && c.team_priority {
+        500.0
+    } else {
+        0.0
+    };
 
     // ── Component B: headroom (0..1100) ──
     // Pace-aware: uses burn rate to project effective remaining time,
@@ -729,7 +802,8 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
             };
 
             // Time relief: if 7d resets within 48h, reduce penalty
-            let time_relief = c.resets_at_7d
+            let time_relief = c
+                .resets_at_7d
                 .map(|ts| {
                     let hours = ((ts - c.now) as f64 / 3600.0).max(0.0);
                     if hours < RELIEF_WINDOW_HOURS {
@@ -755,7 +829,8 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
             let remaining_min = ((reset_ts - c.now).max(0) as f64) / 60.0;
             if remaining_min <= DRAIN_WINDOW_MIN {
                 let remaining_pct = 100.0 - used_5h;
-                let urgency = ((DRAIN_WINDOW_MIN - remaining_min) / DRAIN_WINDOW_MIN).clamp(0.0, 1.0);
+                let urgency =
+                    ((DRAIN_WINDOW_MIN - remaining_min) / DRAIN_WINDOW_MIN).clamp(0.0, 1.0);
                 // waste = remaining quota × urgency, scaled to 0..300
                 (remaining_pct * urgency * 3.0).min(300.0)
             } else {
@@ -830,11 +905,18 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         (primary_parsed, secondary_parsed)
     };
 
-    debug!("parse_usage: primary={} secondary={}", primary.is_some(), secondary.is_some());
+    debug!(
+        "parse_usage: primary={} secondary={}",
+        primary.is_some(),
+        secondary.is_some()
+    );
+
+    let spark_usage = parse_codex_spark_usage(body);
 
     // has_credits=false means no pay-per-use credits (Plus/Pro included usage only).
     // Default true for old API format which lacked this field.
-    let has_credits = body.pointer("/credits/has_credits")
+    let has_credits = body
+        .pointer("/credits/has_credits")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
@@ -843,7 +925,8 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
     // that simply don't use the pay-per-use credits system.
     let credits_balance = if has_credits {
         body.pointer("/credits/balance").and_then(|v| {
-            v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
     } else {
         None
@@ -851,7 +934,10 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
 
     let unlimited_credits = body.pointer("/credits/unlimited").and_then(|v| v.as_bool());
 
-    let plan_type = body.get("plan_type").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let plan_type = body
+        .get("plan_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     UsageInfo {
         fetched_at: Some(auth::now_unix_secs()),
@@ -860,6 +946,7 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         credits_balance,
         unlimited_credits,
         plan_type,
+        spark_usage,
     }
 }
 
@@ -966,6 +1053,7 @@ mod tests {
             credits_balance: None,
             unlimited_credits: None,
             plan_type: None,
+            spark_usage: None,
         }
     }
 
@@ -1075,7 +1163,10 @@ mod tests {
             }
         }));
 
-        assert_eq!(usage.credits_balance, None, "has_credits=false must suppress balance");
+        assert_eq!(
+            usage.credits_balance, None,
+            "has_credits=false must suppress balance"
+        );
         assert_eq!(usage.plan_type.as_deref(), Some("plus"));
     }
 
@@ -1112,8 +1203,14 @@ mod tests {
             }
         }));
 
-        assert!(usage.primary.is_none(), "free account must have no 5h window");
-        assert!(usage.secondary.is_some(), "free account 7d data must be in secondary");
+        assert!(
+            usage.primary.is_none(),
+            "free account must have no 5h window"
+        );
+        assert!(
+            usage.secondary.is_some(),
+            "free account 7d data must be in secondary"
+        );
         assert_eq!(
             usage.secondary.as_ref().and_then(|w| w.used_percent),
             Some(100.0)
@@ -1179,19 +1276,29 @@ mod tests {
         assert!(is_available(&UsageInfo::default()));
     }
 
-
-
     // ── adaptive scoring tests ──
 
-    fn make_candidate(alias: &str, used_5h: f64, reset_5h: Option<i64>, used_7d: f64, reset_7d: Option<i64>) -> Candidate {
+    fn make_candidate(
+        alias: &str,
+        used_5h: f64,
+        reset_5h: Option<i64>,
+        used_7d: f64,
+        reset_7d: Option<i64>,
+    ) -> Candidate {
         Candidate {
             alias: alias.to_string(),
-            used_5h, resets_at_5h: reset_5h,
-            used_7d, resets_at_7d: reset_7d,
-            has_5h_data: true, has_7d_data: true,
-            is_team: false, is_free: false,
-            last_used: 0, now: 1_000_000,
-            pool_size: 5, pool_exhausted: 0,
+            used_5h,
+            resets_at_5h: reset_5h,
+            used_7d,
+            resets_at_7d: reset_7d,
+            has_5h_data: true,
+            has_7d_data: true,
+            is_team: false,
+            is_free: false,
+            last_used: 0,
+            now: 1_000_000,
+            pool_size: 5,
+            pool_exhausted: 0,
             team_priority: true,
         }
     }
@@ -1213,7 +1320,10 @@ mod tests {
         b.is_team = true;
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sb > sa, "team account should beat non-team even with worse 5h: {sb} > {sa}");
+        assert!(
+            sb > sa,
+            "team account should beat non-team even with worse 5h: {sb} > {sa}"
+        );
     }
 
     #[test]
@@ -1227,7 +1337,10 @@ mod tests {
         b.team_priority = false;
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sa > sb, "without team_priority, more remaining should win: {sa} > {sb}");
+        assert!(
+            sa > sb,
+            "without team_priority, more remaining should win: {sa} > {sb}"
+        );
     }
 
     #[test]
@@ -1239,7 +1352,10 @@ mod tests {
         let b = make_candidate("b", 40.0, Some(now + 14400), 20.0, Some(now + 5 * 86400));
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sa > sb, "near-reset account should score higher due to drain: {sa} > {sb}");
+        assert!(
+            sa > sb,
+            "near-reset account should score higher due to drain: {sa} > {sb}"
+        );
     }
 
     #[test]
@@ -1252,7 +1368,10 @@ mod tests {
         let b = make_candidate("b", 40.0, Some(now + 14400), 20.0, Some(now + 5 * 86400));
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sa > 1000.0 && sb > 1000.0, "both should be usable: {sa}, {sb}");
+        assert!(
+            sa > 1000.0 && sb > 1000.0,
+            "both should be usable: {sa}, {sb}"
+        );
         // A consumed 40% over 3h (lower burn rate) → more projected headroom
         assert!(sa > sb, "lower burn rate gives more headroom: {sa} > {sb}");
     }
@@ -1262,7 +1381,10 @@ mod tests {
         let now = 1_000_000i64;
         let a = make_candidate("a", 0.0, Some(now + 18000), 95.0, Some(now + 6 * 86400));
         let b = make_candidate("b", 50.0, Some(now + 7200), 30.0, Some(now + 5 * 86400));
-        assert!(score_unified(&b, 20.0) > score_unified(&a, 20.0), "7d-critical should lose");
+        assert!(
+            score_unified(&b, 20.0) > score_unified(&a, 20.0),
+            "7d-critical should lose"
+        );
     }
 
     #[test]
@@ -1274,7 +1396,10 @@ mod tests {
         let b = make_candidate("b", 30.0, Some(now + 3600), 85.0, Some(now + 5 * 3600));
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
-        assert!(sb > sa, "higher budget-per-window should score better: {sb} > {sa}");
+        assert!(
+            sb > sa,
+            "higher budget-per-window should score better: {sb} > {sa}"
+        );
     }
 
     #[test]
@@ -1284,7 +1409,10 @@ mod tests {
         a.last_used = now - 5; // used 5 seconds ago
         let mut b = make_candidate("b", 40.0, Some(now + 3600), 20.0, Some(now + 5 * 86400));
         b.last_used = now - 1200; // used 20 minutes ago
-        assert!(score_unified(&b, 20.0) > score_unified(&a, 20.0), "recently-used should score lower");
+        assert!(
+            score_unified(&b, 20.0) > score_unified(&a, 20.0),
+            "recently-used should score lower"
+        );
     }
 
     #[test]
@@ -1292,7 +1420,10 @@ mod tests {
         let now = 1_000_000i64;
         let a = make_candidate("a", 80.0, Some(now - 600), 20.0, Some(now + 5 * 86400));
         let score = score_unified(&a, 20.0);
-        assert!(score > 1000.0, "past-reset account should score as fully available, got {score}");
+        assert!(
+            score > 1000.0,
+            "past-reset account should score as fully available, got {score}"
+        );
     }
 
     #[test]
@@ -1334,16 +1465,26 @@ mod tests {
     fn test_adaptive_no_data_low_score() {
         let c = Candidate {
             alias: "unknown".to_string(),
-            used_5h: 0.0, resets_at_5h: None,
-            used_7d: 0.0, resets_at_7d: None,
-            has_5h_data: false, has_7d_data: false,
-            is_team: false, is_free: false,
-            last_used: 0, now: 1_000_000,
-            pool_size: 1, pool_exhausted: 0,
+            used_5h: 0.0,
+            resets_at_5h: None,
+            used_7d: 0.0,
+            resets_at_7d: None,
+            has_5h_data: false,
+            has_7d_data: false,
+            is_team: false,
+            is_free: false,
+            last_used: 0,
+            now: 1_000_000,
+            pool_size: 1,
+            pool_exhausted: 0,
             team_priority: true,
         };
         // headroom=50 (no 5h data) + sustain=-50 (no 7d data) = 0
-        assert_eq!(score_unified(&c, 20.0), 0.0, "no-data account should score exactly 0");
+        assert_eq!(
+            score_unified(&c, 20.0),
+            0.0,
+            "no-data account should score exactly 0"
+        );
     }
 
     #[test]
@@ -1355,7 +1496,10 @@ mod tests {
         c.has_7d_data = true;
         let s = score_unified(&c, 20.0);
         // headroom=0 (exhausted, no reset), sustain should still be heavily negative
-        assert!(s < -700.0, "doubly-exhausted account must score very low, got {s}");
+        assert!(
+            s < -700.0,
+            "doubly-exhausted account must score very low, got {s}"
+        );
     }
 
     #[test]
@@ -1363,16 +1507,25 @@ mod tests {
         // Worst case: both exhausted, no reset info at all
         let c = Candidate {
             alias: "dead".to_string(),
-            used_5h: 100.0, resets_at_5h: None,
-            used_7d: 100.0, resets_at_7d: None,
-            has_5h_data: true, has_7d_data: true,
-            is_team: false, is_free: false,
-            last_used: 0, now: 1_000_000,
-            pool_size: 1, pool_exhausted: 1,
+            used_5h: 100.0,
+            resets_at_5h: None,
+            used_7d: 100.0,
+            resets_at_7d: None,
+            has_5h_data: true,
+            has_7d_data: true,
+            is_team: false,
+            is_free: false,
+            last_used: 0,
+            now: 1_000_000,
+            pool_size: 1,
+            pool_exhausted: 1,
             team_priority: false,
         };
         let s = score_unified(&c, 20.0);
-        assert!(s < -700.0, "doubly-exhausted no-reset account must score very low, got {s}");
+        assert!(
+            s < -700.0,
+            "doubly-exhausted no-reset account must score very low, got {s}"
+        );
     }
 
     #[test]
@@ -1387,7 +1540,10 @@ mod tests {
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
         // B has slower burn rate → higher projected exhaustion → higher headroom
-        assert!(sb > sa, "slower burn rate should give higher headroom: {sb} > {sa}");
+        assert!(
+            sb > sa,
+            "slower burn rate should give higher headroom: {sb} > {sa}"
+        );
     }
 
     #[test]

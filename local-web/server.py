@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import html
 import io
 import json
@@ -23,7 +24,7 @@ import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,8 @@ CONFIG_PATH = Path(os.environ.get("CODEX_SWITCH_WEB_CONFIG", str(Path.home() / "
 PROFILE_ROOT = Path(os.environ.get("CODEX_SWITCH_PROFILE_ROOT", str(Path.home() / ".codex-switch/profiles")))
 SHARE_DIR = Path(os.environ.get("CODEX_SWITCH_SHARE_DIR", str(Path.home() / ".codex-switch/share")))
 MACHINE_USAGE_CACHE = Path(os.environ.get("CODEX_SWITCH_MACHINE_USAGE_CACHE", str(Path.home() / ".codex-switch/machine-usage-cache.json")))
+ANTHROPIC_ACCOUNTS_PATH = Path(os.environ.get("CODEX_SWITCH_ANTHROPIC_ACCOUNTS", str(Path.home() / ".codex-switch/anthropic-accounts.json")))
+GROK_ACCOUNTS_PATH = Path(os.environ.get("CODEX_SWITCH_GROK_ACCOUNTS", str(Path.home() / ".codex-switch/grok-accounts.json")))
 MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
 REFRESH_INTERVAL_SECONDS = 30 * 60
 DEVICE_URL_FALLBACK = "https://auth.openai.com/codex/device"
@@ -79,7 +82,7 @@ def json_from_mixed_stdout(stdout: str):
 
 
 def _default_config() -> dict:
-    return {"accounts": DEFAULT_ACCOUNTS, "machine_usage_sheet_csv_url": "", "machine_overrides": {}}
+    return {"accounts": DEFAULT_ACCOUNTS, "machine_usage_sheet_csv_url": "", "machine_overrides": {}, "default_share_model": ""}
 
 
 def load_config() -> dict:
@@ -97,6 +100,8 @@ def load_config() -> dict:
             cfg = _default_config()
         if not isinstance(cfg.get("machine_overrides"), dict):
             cfg["machine_overrides"] = {}
+        if "default_share_model" not in cfg:
+            cfg["default_share_model"] = ""
         by_alias = {a.get("alias"): a for a in cfg.get("accounts", []) if isinstance(a, dict)}
         changed = False
         for acct in DEFAULT_ACCOUNTS:
@@ -137,6 +142,7 @@ def get_expected_accounts() -> list[dict]:
             "expected_plan": plan_label,
             "plan_label": plan_label,
             "plan_details": str(acct.get("plan_details") or "")[:500],
+            "codex_spark_access": bool(acct.get("codex_spark_access")),
         })
     return accounts or DEFAULT_ACCOUNTS.copy()
 
@@ -161,7 +167,7 @@ def set_account_label(alias: str, label: str) -> dict:
         return acct
 
 
-def set_account_details(alias: str, label: str | None = None, plan_label: str | None = None, plan_details: str | None = None) -> dict:
+def set_account_details(alias: str, label: str | None = None, plan_label: str | None = None, plan_details: str | None = None, codex_spark_access: bool | str | None = None) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
         raise ValueError("invalid alias")
     with config_lock:
@@ -182,6 +188,12 @@ def set_account_details(alias: str, label: str | None = None, plan_label: str | 
             acct["expected_plan"] = clean_plan
         if plan_details is not None:
             acct["plan_details"] = str(plan_details or "").strip()[:500]
+        if codex_spark_access is not None:
+            if isinstance(codex_spark_access, bool):
+                acct["codex_spark_access"] = bool(codex_spark_access)
+            else:
+                raw = str(codex_spark_access).strip().lower()
+                acct["codex_spark_access"] = raw in {"1", "true", "yes", "on", "y", "t"}
         save_config_unlocked(cfg)
         return acct
 
@@ -248,7 +260,496 @@ def reorder_accounts(aliases: list[str]) -> dict:
     return {"ok": True, "accounts": get_expected_accounts()}
 
 
-def build_share_auth(alias: str) -> dict:
+def short_fingerprint(value: str | bytes | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.encode()
+    return hashlib.sha256(value).hexdigest()[:12]
+
+
+def extract_codex_tokens(auth_payload: dict) -> dict:
+    tokens = auth_payload.get("tokens")
+    if not isinstance(tokens, dict):
+        raise ValueError("auth file is missing tokens object")
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise ValueError("auth file is missing tokens.access_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise ValueError("auth file is missing tokens.refresh_token")
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "account_id": tokens.get("account_id"),
+        "id_token": tokens.get("id_token"),
+        "last_refresh": auth_payload.get("last_refresh"),
+    }
+
+
+def hermes_auth_targets() -> list[Path]:
+    hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    targets = [hermes_home / "auth.json"]
+    profiles_root = hermes_home / "profiles"
+    if profiles_root.exists():
+        targets.extend(sorted(profiles_root.glob("*/auth.json")))
+    # Only write stores that already exist; avoid inventing profile state.
+    return [p for p in targets if p.exists()]
+
+
+def safe_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    os.chmod(path, 0o600)
+
+
+
+def sanitize_default_model(model: str | None) -> str:
+    model = str(model or "").strip()[:120]
+    if not model:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9._:/+-]{1,120}", model):
+        raise ValueError("default model contains unsupported characters")
+    return model
+
+
+def get_current_default_model() -> str:
+    # Prefer Hermes' configured default, then Codex CLI's top-level model.
+    hermes_cfg = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "config.yaml"
+    try:
+        text = hermes_cfg.read_text()
+        in_model = False
+        for line in text.splitlines():
+            if re.match(r"^model:\s*$", line):
+                in_model = True
+                continue
+            if in_model and line and not line.startswith((" ", "\t")):
+                in_model = False
+            if in_model:
+                m = re.match(r"^\s+default:\s*['\"]?([^'\"#\s]+)", line)
+                if m:
+                    return sanitize_default_model(m.group(1))
+    except Exception:
+        pass
+    codex_cfg = CODEX_HOME / "config.toml"
+    try:
+        text = codex_cfg.read_text()
+        m = re.search(r"(?m)^\s*model\s*=\s*['\"]([^'\"]+)['\"]", text)
+        if m:
+            return sanitize_default_model(m.group(1))
+    except Exception:
+        pass
+    cfg_model = load_config().get("default_share_model")
+    try:
+        return sanitize_default_model(cfg_model)
+    except Exception:
+        return ""
+
+
+def _toml_quote(value: str) -> str:
+    return json.dumps(value)
+
+
+def set_codex_default_model_config(path: Path, model: str) -> bool:
+    model = sanitize_default_model(model)
+    if not model:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text() if path.exists() else ""
+    line = f"model = {_toml_quote(model)}"
+    if re.search(r"(?m)^\s*model\s*=\s*['\"][^'\"]*['\"]\s*$", text):
+        text = re.sub(r"(?m)^\s*model\s*=\s*['\"][^'\"]*['\"]\s*$", line, text, count=1)
+    else:
+        text = line + "\n" + text
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text if text.endswith("\n") else text + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    os.chmod(path, 0o600)
+    return True
+
+
+def set_hermes_default_model_config(path: Path, model: str) -> bool:
+    model = sanitize_default_model(model)
+    if not model:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text() if path.exists() else "model:\n  provider: openai-codex\n"
+    lines = text.splitlines()
+    out = []
+    in_model = False
+    saw_model = False
+    set_default = False
+    inserted = False
+    for line in lines:
+        if re.match(r"^model:\s*$", line):
+            if in_model and not set_default:
+                out.append(f"  default: {model}")
+                inserted = True
+            in_model = True
+            saw_model = True
+            set_default = False
+            out.append(line)
+            continue
+        if in_model and line and not line.startswith((" ", "\t")):
+            if not set_default:
+                out.append(f"  default: {model}")
+                inserted = True
+            in_model = False
+        if in_model and re.match(r"^\s+default:\s*", line):
+            out.append(f"  default: {model}")
+            set_default = True
+            continue
+        out.append(line)
+    if in_model and not set_default:
+        out.append(f"  default: {model}")
+        inserted = True
+    if not saw_model:
+        out = ["model:", f"  default: {model}", "  provider: openai-codex", *out]
+        inserted = True
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text("\n".join(out).rstrip() + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    os.chmod(path, 0o600)
+    return True
+
+
+def apply_default_model_to_local_configs(model: str) -> dict:
+    model = sanitize_default_model(model)
+    if not model:
+        return {"requested": False, "model": "", "codex_config_updated": False, "hermes_configs_updated": []}
+    codex_updated = set_codex_default_model_config(CODEX_HOME / "config.toml", model)
+    hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    hermes_paths = [hermes_home / "config.yaml"]
+    profiles = hermes_home / "profiles"
+    if profiles.exists():
+        hermes_paths.extend(sorted(profiles.glob("*/config.yaml")))
+    hermes_results = []
+    for path in hermes_paths:
+        if path.exists() or path == hermes_home / "config.yaml":
+            try:
+                hermes_results.append({"path": str(path), "updated": set_hermes_default_model_config(path, model)})
+            except Exception as exc:
+                hermes_results.append({"path": str(path), "updated": False, "error": str(exc)})
+    return {"requested": True, "model": model, "codex_config_updated": codex_updated, "hermes_configs_updated": hermes_results}
+
+def update_hermes_codex_auth_store(path: Path, codex_tokens: dict, alias: str) -> dict:
+    before = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(before, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    data = json.loads(json.dumps(before))
+    now = datetime.utcnow().isoformat(timespec="microseconds") + "Z"
+    last_refresh = codex_tokens.get("last_refresh") or now
+
+    providers = data.setdefault("providers", {})
+    provider = providers.setdefault("openai-codex", {})
+    provider["tokens"] = {
+        "access_token": codex_tokens["access_token"],
+        "refresh_token": codex_tokens["refresh_token"],
+    }
+    provider["last_refresh"] = last_refresh
+    provider["auth_mode"] = provider.get("auth_mode") or "chatgpt"
+    provider["synced_from"] = "codex-switch-share-auth"
+    provider["synced_from_alias"] = alias
+    provider["synced_at"] = now
+    # A stale relogin_required error can make the UI/runtime look broken after a valid sync.
+    provider.pop("last_auth_error", None)
+
+    pool = data.setdefault("credential_pool", {})
+    entries = pool.setdefault("openai-codex", [])
+    if not isinstance(entries, list):
+        entries = []
+        pool["openai-codex"] = entries
+    if not entries:
+        entries.append({
+            "id": hashlib.sha256((codex_tokens["refresh_token"] + alias).encode()).hexdigest()[:6],
+            "label": f"codex-switch:{alias}",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "codex-switch-share-auth",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "request_count": 0,
+        })
+    updated_entries = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        is_oauth = entry.get("auth_type") == "oauth" or "access_token" in entry or "refresh_token" in entry
+        if not is_oauth:
+            continue
+        entry["access_token"] = codex_tokens["access_token"]
+        entry["refresh_token"] = codex_tokens["refresh_token"]
+        entry["last_refresh"] = last_refresh
+        entry["source"] = entry.get("source") or "codex-switch-share-auth"
+        entry["synced_from_alias"] = alias
+        entry["synced_at"] = now
+        for key in ("last_status", "last_error_code", "last_error_reason", "last_error_message", "last_error_reset_at"):
+            entry[key] = None
+        updated_entries += 1
+
+    data.setdefault("version", 1)
+    data["active_provider"] = data.get("active_provider") or "openai-codex"
+    data["updated_at"] = datetime.now().astimezone().isoformat()
+
+    safe_write_json(path, data)
+    return {
+        "path": str(path),
+        "provider_updated": True,
+        "pool_entries_updated": updated_entries,
+        "access_fingerprint": short_fingerprint(codex_tokens["access_token"]),
+        "refresh_fingerprint": short_fingerprint(codex_tokens["refresh_token"]),
+    }
+
+
+def sync_auth_to_local_stores(alias: str, default_model: str | None = None) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+        raise ValueError("invalid alias")
+    source_path = PROFILE_ROOT / alias / "auth.json"
+    if not source_path.exists():
+        raise FileNotFoundError(f"saved auth profile not found for {alias}")
+    raw = source_path.read_bytes()
+    source_payload = json.loads(raw.decode())
+    if not isinstance(source_payload, dict):
+        raise ValueError("auth file is not a JSON object")
+    codex_tokens = extract_codex_tokens(source_payload)
+    clean_default_model = sanitize_default_model(default_model)
+
+    codex_target = CODEX_HOME / "auth.json"
+    codex_target.parent.mkdir(parents=True, exist_ok=True)
+    codex_target.write_bytes(raw)
+    os.chmod(codex_target, 0o600)
+
+    hermes_results = []
+    for target in hermes_auth_targets():
+        hermes_results.append(update_hermes_codex_auth_store(target, codex_tokens, alias))
+    model_result = apply_default_model_to_local_configs(clean_default_model) if clean_default_model else {"requested": False, "model": "", "codex_config_updated": False, "hermes_configs_updated": []}
+
+    return {
+        "ok": True,
+        "alias": alias,
+        "source": str(source_path),
+        "codex_target": str(codex_target),
+        "hermes_targets": hermes_results,
+        "fingerprints": {
+            "payload": short_fingerprint(raw),
+            "access_token": short_fingerprint(codex_tokens["access_token"]),
+            "refresh_token": short_fingerprint(codex_tokens["refresh_token"]),
+        },
+        "default_model": model_result,
+        "restart_note": "On-disk auth stores were updated. Long-lived Hermes processes may need an explicit approved restart to use the new in-memory credentials. Restart command after approval: hermes gateway restart (or hermes --profile <profile> gateway restart for profile-specific gateways).",
+    }
+
+
+def build_bash_multi_auth_installer(b64_payload: str, default_model: str = "") -> str:
+    """Build a pasteable installer that syncs Codex CLI plus existing Hermes auth stores.
+
+    The command contains the sensitive auth payload by design, but prints only safe
+    fingerprints and paths when run.
+    """
+    clean_default_model = sanitize_default_model(default_model)
+    return f"""set -euo pipefail
+python3 - <<'PY_INSTALL'
+import base64, hashlib, json, os, re
+from datetime import datetime
+from pathlib import Path
+
+raw = base64.b64decode({b64_payload!r})
+default_model = {clean_default_model!r}
+home = Path.home()
+codex_auth = home / '.codex' / 'auth.json'
+codex_auth.parent.mkdir(parents=True, exist_ok=True)
+codex_auth.write_bytes(raw)
+os.chmod(codex_auth, 0o600)
+
+payload = json.loads(raw.decode())
+tokens = payload.get('tokens') if isinstance(payload, dict) else None
+if not isinstance(tokens, dict):
+    raise SystemExit('auth payload is missing tokens object')
+access_token = tokens.get('access_token')
+refresh_token = tokens.get('refresh_token')
+if not isinstance(access_token, str) or not access_token:
+    raise SystemExit('auth payload is missing tokens.access_token')
+if not isinstance(refresh_token, str) or not refresh_token:
+    raise SystemExit('auth payload is missing tokens.refresh_token')
+last_refresh = payload.get('last_refresh') or (datetime.utcnow().isoformat(timespec='microseconds') + 'Z')
+now = datetime.utcnow().isoformat(timespec='microseconds') + 'Z'
+
+def fp(value):
+    if isinstance(value, str):
+        value = value.encode()
+    return hashlib.sha256(value).hexdigest()[:12]
+
+def write_json(path, data):
+    tmp = path.with_name(f'.{{path.name}}.{{os.getpid()}}.tmp')
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=False) + '\\n')
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    os.chmod(path, 0o600)
+
+def write_text_600(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{{path.name}}.{{os.getpid()}}.tmp')
+    tmp.write_text(text if text.endswith('\\n') else text + '\\n')
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    os.chmod(path, 0o600)
+
+def set_codex_default_model(path, model):
+    if not model:
+        return False
+    if not re.fullmatch(r'[A-Za-z0-9._:/+-]{{1,120}}', model):
+        raise SystemExit('default model contains unsupported characters')
+    text = path.read_text() if path.exists() else ''
+    line = 'model = ' + json.dumps(model)
+    pattern = '''(?m)^\\s*model\\s*=\\s*['"][^'"]*['"]\\s*$'''
+    if re.search(pattern, text):
+        text = re.sub(pattern, line, text, count=1)
+    else:
+        text = line + '\\n' + text
+    write_text_600(path, text)
+    return True
+
+def set_hermes_default_model(path, model):
+    if not model:
+        return False
+    if not re.fullmatch(r'[A-Za-z0-9._:/+-]{{1,120}}', model):
+        raise SystemExit('default model contains unsupported characters')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text() if path.exists() else 'model:\\n  provider: openai-codex\\n'
+    lines = text.splitlines()
+    out = []
+    in_model = False
+    saw_model = False
+    set_default = False
+    for line in lines:
+        if re.match(r'^model:\s*$', line):
+            if in_model and not set_default:
+                out.append(f'  default: {{model}}')
+            in_model = True
+            saw_model = True
+            set_default = False
+            out.append(line)
+            continue
+        if in_model and line and not line.startswith((' ', '\t')):
+            if not set_default:
+                out.append(f'  default: {{model}}')
+            in_model = False
+        if in_model and re.match(r'^\s+default:\s*', line):
+            out.append(f'  default: {{model}}')
+            set_default = True
+            continue
+        out.append(line)
+    if in_model and not set_default:
+        out.append(f'  default: {{model}}')
+    if not saw_model:
+        out = ['model:', f'  default: {{model}}', '  provider: openai-codex', *out]
+    write_text_600(path, '\\n'.join(out).rstrip() + '\\n')
+    return True
+
+def apply_default_model(model):
+    if not model:
+        return []
+    updated = []
+    codex_config = home / '.codex' / 'config.toml'
+    updated.append(('codex', str(codex_config), set_codex_default_model(codex_config, model)))
+    hermes_home = Path(os.environ.get('HERMES_HOME', str(home / '.hermes')))
+    config_targets = [hermes_home / 'config.yaml']
+    profiles = hermes_home / 'profiles'
+    if profiles.exists():
+        config_targets.extend(sorted(profiles.glob('*/config.yaml')))
+    for path in config_targets:
+        if path.exists() or path == hermes_home / 'config.yaml':
+            try:
+                updated.append(('hermes', str(path), set_hermes_default_model(path, model)))
+            except Exception as exc:
+                updated.append(('hermes', str(path), f'ERROR: {{exc}}'))
+    return updated
+
+def sync_hermes_store(path):
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f'{{path}} is not a JSON object')
+    provider = data.setdefault('providers', {{}}).setdefault('openai-codex', {{}})
+    provider['tokens'] = {{'access_token': access_token, 'refresh_token': refresh_token}}
+    provider['last_refresh'] = last_refresh
+    provider['auth_mode'] = provider.get('auth_mode') or 'chatgpt'
+    provider['synced_from'] = 'codex-switch-share-auth-paste-installer'
+    provider['synced_at'] = now
+    provider.pop('last_auth_error', None)
+
+    pool = data.setdefault('credential_pool', {{}})
+    entries = pool.setdefault('openai-codex', [])
+    if not isinstance(entries, list):
+        entries = []
+        pool['openai-codex'] = entries
+    if not entries:
+        entries.append({{
+            'id': hashlib.sha256(refresh_token.encode()).hexdigest()[:6],
+            'label': 'codex-switch pasted auth',
+            'auth_type': 'oauth',
+            'priority': 0,
+            'source': 'codex-switch-share-auth-paste-installer',
+            'base_url': 'https://chatgpt.com/backend-api/codex',
+            'request_count': 0,
+        }})
+    updated = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('auth_type') == 'oauth' or 'access_token' in entry or 'refresh_token' in entry:
+            entry['access_token'] = access_token
+            entry['refresh_token'] = refresh_token
+            entry['last_refresh'] = last_refresh
+            entry['synced_at'] = now
+            for key in ('last_status', 'last_error_code', 'last_error_reason', 'last_error_message', 'last_error_reset_at'):
+                entry[key] = None
+            updated += 1
+    data.setdefault('version', 1)
+    data['active_provider'] = data.get('active_provider') or 'openai-codex'
+    data['updated_at'] = datetime.now().astimezone().isoformat()
+    write_json(path, data)
+    return updated
+
+hermes_home = Path(os.environ.get('HERMES_HOME', str(home / '.hermes')))
+targets = [hermes_home / 'auth.json']
+profiles = hermes_home / 'profiles'
+if profiles.exists():
+    targets.extend(sorted(profiles.glob('*/auth.json')))
+existing_targets = [p for p in targets if p.exists()]
+results = []
+for target in existing_targets:
+    try:
+        results.append((str(target), sync_hermes_store(target)))
+    except Exception as exc:
+        results.append((str(target), f'ERROR: {{exc}}'))
+
+print('Installed Codex auth:', codex_auth)
+print('Payload fp:', fp(raw))
+print('Access token fp:', fp(access_token))
+print('Refresh token fp:', fp(refresh_token))
+print('Hermes stores updated:')
+if results:
+    for path, updated in results:
+        print(f'- {{path}} (pool entries updated: {{updated}})')
+else:
+    print('- none found')
+model_updates = apply_default_model(default_model)
+if default_model:
+    print('Default model set:', default_model)
+    for kind, path, updated in model_updates:
+        print(f'- {{kind}} config {{path}}: {{updated}}')
+else:
+    print('Default model unchanged')
+print('Restart Hermes after approval if a gateway/session is already running: hermes gateway restart')
+print('Profile-specific example: hermes --profile <profile> gateway restart')
+PY_INSTALL"""
+
+
+def build_share_auth(alias: str, default_model: str | None = None) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
         raise ValueError("invalid alias")
     auth_path = PROFILE_ROOT / alias / "auth.json"
@@ -267,21 +768,16 @@ def build_share_auth(alias: str) -> dict:
     os.chmod(bundle_path, 0o600)
 
     b64 = base64.b64encode(raw).decode()
+    clean_default_model = sanitize_default_model(default_model)
     q_alias = shlex.quote(alias)
     q_bundle = shlex.quote(str(bundle_path))
     q_bin = shlex.quote(BIN)
-    bash_payload_cmd = (
-        "umask 077; mkdir -p ~/.codex; "
-        "base64 -d > ~/.codex/auth.json <<'AUTH_PAYLOAD'\n"
-        f"{b64}\n"
-        "AUTH_PAYLOAD\n"
-        "chmod 600 ~/.codex/auth.json"
-    )
+    bash_payload_cmd = build_bash_multi_auth_installer(b64, clean_default_model)
     powershell_wsl_payload_cmd = (
-        "$payload = @'\n"
-        f"{b64}\n"
+        "$script = @'\n"
+        f"{bash_payload_cmd}\n"
         "'@\n"
-        "$payload | wsl.exe bash -lc 'umask 077; mkdir -p ~/.codex; base64 -d > ~/.codex/auth.json; chmod 600 ~/.codex/auth.json'"
+        "$script | wsl.exe bash -lc 'tmp=$(mktemp); cat > \"$tmp\"; bash \"$tmp\"; rc=$?; rm -f \"$tmp\"; exit $rc'"
     )
     powershell_windows_payload_cmd = (
         "$payload = @'\n"
@@ -289,7 +785,8 @@ def build_share_auth(alias: str) -> dict:
         "'@\n"
         "$dir = \"$HOME\\.codex\"\n"
         "New-Item -ItemType Directory -Force $dir | Out-Null\n"
-        "[IO.File]::WriteAllBytes(\"$dir\\auth.json\", [Convert]::FromBase64String($payload))"
+        "[IO.File]::WriteAllBytes(\"$dir\\auth.json\", [Convert]::FromBase64String($payload))\n"
+        + (f"$model = {json.dumps(clean_default_model)}\n$config = \"$dir\\config.toml\"\nif ($model) {{ if (Test-Path $config) {{ $text = Get-Content -Raw $config }} else {{ $text = \"\" }}; $line = \"model = \\\"$model\\\"\"; if ($text -match \"(?m)^\\s*model\\s*=\\s*[\\'\\\"][^\\'\\\"]*[\\'\\\"]\\s*$\") {{ $text = [regex]::Replace($text, \"(?m)^\\s*model\\s*=\\s*[\\'\\\"][^\\'\\\"]*[\\'\\\"]\\s*$\", $line, 1) }} else {{ $text = $line + [Environment]::NewLine + $text }}; Set-Content -Path $config -Value $text -NoNewline }}" if clean_default_model else "")
     )
     return {
         "ok": True,
@@ -297,13 +794,15 @@ def build_share_auth(alias: str) -> dict:
         "bundle_path": str(bundle_path),
         "warning": "Sensitive OAuth auth payload. Only paste/share with your own trusted agent machine. Rotate/re-auth if exposed.",
         "same_machine_switch_command": f"{q_bin} use {q_alias}",
-        "same_machine_install_command": f"umask 077; mkdir -p ~/.codex; install -m 600 {q_bundle} ~/.codex/auth.json",
+        "same_machine_install_command": f"umask 077; mkdir -p ~/.codex; install -m 600 {q_bundle} ~/.codex/auth.json" + (f"; python3 - <<'PY_MODEL'\nfrom pathlib import Path\nimport json, re, os\nmodel = {clean_default_model!r}\npath = Path.home()/'.codex'/'config.toml'\ntext = path.read_text() if path.exists() else ''\nline = 'model = ' + json.dumps(model)\ntext = re.sub(r'(?m)^\\s*model\\s*=\\s*[\"\\\'][^\"\\\']*[\"\\\']\\s*$', line, text, count=1) if re.search(r'(?m)^\\s*model\\s*=\\s*[\"\\\'][^\"\\\']*[\"\\\']\\s*$', text) else line + '\\n' + text\npath.parent.mkdir(parents=True, exist_ok=True); path.write_text(text if text.endswith('\\n') else text+'\\n'); os.chmod(path,0o600)\nprint('Default Codex model set:', model)\nPY_MODEL" if clean_default_model else ""),
         # Backwards-compatible field. Default to the PowerShell->WSL installer because Mike often copies from Windows Terminal/PowerShell into WSL-backed Hermes/Codex agents.
         "target_machine_payload_install_command": powershell_wsl_payload_cmd,
         "target_machine_powershell_wsl_install_command": powershell_wsl_payload_cmd,
         "target_machine_bash_install_command": bash_payload_cmd,
         "target_machine_powershell_windows_install_command": powershell_windows_payload_cmd,
         "target_machine_import_command_note": f"If you copy {bundle_path.name} to another machine, import it there with: {q_bin} import /path/to/{shlex.quote(bundle_path.name)} {q_alias}",
+        "default_model": clean_default_model,
+        "default_model_note": (f"Generated installers will set Codex + Hermes default model to {clean_default_model}." if clean_default_model else "Generated installers leave default model unchanged."),
     }
 
 
@@ -504,6 +1003,258 @@ def parse_filter_ts(value: str | None, default: datetime) -> int:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=MELBOURNE_TZ)
     return int(dt.timestamp())
+
+
+def _safe_key_fingerprint(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()[:12] if api_key else "missing"
+
+
+def load_anthropic_accounts() -> list[dict]:
+    if not ANTHROPIC_ACCOUNTS_PATH.exists():
+        return []
+    data = json.loads(ANTHROPIC_ACCOUNTS_PATH.read_text())
+    accounts = data.get("accounts") if isinstance(data, dict) else data
+    if not isinstance(accounts, list):
+        return []
+    clean = []
+    for idx, acct in enumerate(accounts):
+        if not isinstance(acct, dict):
+            continue
+        key = str(acct.get("api_key") or "").strip()
+        label = str(acct.get("label") or acct.get("alias") or f"Anthropic {idx + 1}")[:120]
+        alias = str(acct.get("alias") or re.sub(r"[^a-z0-9._-]+", "-", label.lower()).strip("-") or f"anthropic-{idx + 1}")[:64]
+        clean.append({"alias": alias, "label": label, "api_key": key})
+    return clean
+
+
+def anthropic_get(api_key: str, path: str, params: dict | None = None) -> dict:
+    query = urlencode(params or {}, doseq=True)
+    url = f"https://api.anthropic.com{path}" + (f"?{query}" if query else "")
+    req = Request(url, headers={
+        "anthropic-version": "2023-06-01",
+        "x-api-key": api_key,
+        "User-Agent": "codex-account-usage-local/1.0",
+    })
+    try:
+        with urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return {"ok": True, "status": resp.status, "data": json.loads(raw) if raw else {}}
+    except Exception as exc:
+        status = getattr(exc, "code", None)
+        body = ""
+        try:
+            reader = getattr(exc, "read", None)
+            body = reader().decode("utf-8", "replace")[:1000] if reader else str(exc)[:1000]
+        except Exception:
+            body = str(exc)[:1000]
+        return {"ok": False, "status": status, "error": body or str(exc)}
+
+
+def anthropic_admin_get(api_key: str, path: str, params: dict) -> dict:
+    return anthropic_get(api_key, path, params)
+
+
+def _sum_numbers(obj, wanted_keys: set[str]) -> float:
+    total = 0.0
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in wanted_keys and isinstance(value, (int, float)):
+                total += float(value)
+            elif isinstance(value, (dict, list)):
+                total += _sum_numbers(value, wanted_keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            total += _sum_numbers(item, wanted_keys)
+    return total
+
+
+def get_anthropic_usage() -> dict:
+    accounts = load_anthropic_accounts()
+    now = datetime.now(MELBOURNE_TZ)
+    ending = now.astimezone(ZoneInfo("UTC")).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    start_1d = (now - timedelta(days=1)).astimezone(ZoneInfo("UTC")).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    start_7d = (now - timedelta(days=7)).astimezone(ZoneInfo("UTC")).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    rows = []
+    for acct in accounts:
+        api_key = acct["api_key"]
+        row = {
+            "alias": acct["alias"],
+            "label": acct["label"],
+            "key_fingerprint": _safe_key_fingerprint(api_key),
+            "configured": bool(api_key and not api_key.endswith("...FQAA") and not api_key.endswith("...UQAA") and "..." not in api_key),
+        }
+        if not row["configured"]:
+            row.update({"ok": False, "error": "API key not configured in local anthropic-accounts.json"})
+            rows.append(row)
+            continue
+        models = anthropic_get(api_key, "/v1/models")
+        row["key_valid"] = bool(models.get("ok"))
+        row["models_count"] = len((models.get("data") or {}).get("data", [])) if models.get("ok") else 0
+        usage_1d = anthropic_admin_get(api_key, "/v1/organizations/usage_report/messages", {"starting_at": start_1d, "ending_at": ending, "bucket_width": "1d"})
+        usage_7d = anthropic_admin_get(api_key, "/v1/organizations/usage_report/messages", {"starting_at": start_7d, "ending_at": ending, "bucket_width": "1d"})
+        cost_7d = anthropic_admin_get(api_key, "/v1/organizations/cost_report", {"starting_at": start_7d, "ending_at": ending, "group_by[]": ["description"]})
+        row["usage_1d_ok"] = usage_1d.get("ok")
+        row["usage_7d_ok"] = usage_7d.get("ok")
+        row["cost_7d_ok"] = cost_7d.get("ok")
+        row["ok"] = bool(usage_1d.get("ok") or usage_7d.get("ok") or cost_7d.get("ok"))
+        row["input_tokens_1d"] = int(_sum_numbers(usage_1d.get("data"), {"input_tokens", "input_token_count", "uncached_input_tokens"})) if usage_1d.get("ok") else 0
+        row["output_tokens_1d"] = int(_sum_numbers(usage_1d.get("data"), {"output_tokens", "output_token_count"})) if usage_1d.get("ok") else 0
+        row["total_tokens_1d"] = int(_sum_numbers(usage_1d.get("data"), {"input_tokens", "input_token_count", "uncached_input_tokens", "output_tokens", "output_token_count"})) if usage_1d.get("ok") else 0
+        row["input_tokens_7d"] = int(_sum_numbers(usage_7d.get("data"), {"input_tokens", "input_token_count", "uncached_input_tokens"})) if usage_7d.get("ok") else 0
+        row["output_tokens_7d"] = int(_sum_numbers(usage_7d.get("data"), {"output_tokens", "output_token_count"})) if usage_7d.get("ok") else 0
+        row["total_tokens_7d"] = int(_sum_numbers(usage_7d.get("data"), {"input_tokens", "input_token_count", "uncached_input_tokens", "output_tokens", "output_token_count"})) if usage_7d.get("ok") else 0
+        row["cost_usd_7d"] = round(_sum_numbers(cost_7d.get("data"), {"cost", "amount", "amount_usd", "total_cost", "total_cost_usd"}), 4) if cost_7d.get("ok") else None
+        errors = []
+        for name, result in (("usage_1d", usage_1d), ("usage_7d", usage_7d), ("cost_7d", cost_7d)):
+            if not result.get("ok"):
+                errors.append({"source": name, "status": result.get("status"), "error": result.get("error")})
+        row["errors"] = errors[:3]
+        row["credit_note"] = "Usage/cost/credit require Anthropic Admin Usage & Cost API access. This key is valid for normal API calls but admin reports are blocked." if row.get("key_valid") and not row.get("ok") else "Anthropic's documented Admin API exposes usage and cost reports; credit/balance may not be available through public API for this key."
+        rows.append(row)
+    return {
+        "ok": True,
+        "configured_count": len([r for r in rows if r.get("configured")]),
+        "account_count": len(rows),
+        "source": "anthropic_admin_usage_cost_api",
+        "config_path": str(ANTHROPIC_ACCOUNTS_PATH),
+        "ending_at": ending,
+        "start_1d": start_1d,
+        "start_7d": start_7d,
+        "rows": rows,
+    }
+
+
+def load_grok_accounts() -> list[dict]:
+    if not GROK_ACCOUNTS_PATH.exists():
+        return []
+    data = json.loads(GROK_ACCOUNTS_PATH.read_text())
+    accounts = data.get("accounts") if isinstance(data, dict) else data
+    if not isinstance(accounts, list):
+        return []
+    clean = []
+    for idx, acct in enumerate(accounts):
+        if not isinstance(acct, dict):
+            continue
+        key = str(acct.get("api_key") or "").strip()
+        label = str(acct.get("label") or acct.get("alias") or f"Grok {idx + 1}")[:120]
+        alias = str(acct.get("alias") or re.sub(r"[^a-z0-9._-]+", "-", label.lower()).strip("-") or f"grok-{idx + 1}")[:64]
+        clean.append({"alias": alias, "label": label, "api_key": key})
+    return clean
+
+
+def _api_key_accounts_path(provider: str) -> Path:
+    if provider == "anthropic":
+        return ANTHROPIC_ACCOUNTS_PATH
+    if provider == "grok":
+        return GROK_ACCOUNTS_PATH
+    raise ValueError("provider must be anthropic or grok")
+
+
+def add_api_key_account(provider: str, alias: str, label: str, api_key: str) -> dict:
+    provider = str(provider or "").strip().lower()
+    if provider not in {"anthropic", "grok"}:
+        raise ValueError("provider must be anthropic or grok")
+    alias = str(alias or "").strip()
+    label = str(label or "").strip()[:120]
+    api_key = str(api_key or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+        raise ValueError("invalid alias")
+    if not label:
+        raise ValueError("display name cannot be empty")
+    if not api_key or "..." in api_key:
+        raise ValueError("paste the full API key; placeholders are not saved")
+    if provider == "anthropic" and not api_key.startswith("sk-ant-"):
+        raise ValueError("Anthropic keys normally start with sk-ant-")
+    if provider == "grok" and not (api_key.startswith("xai-") or api_key.startswith("sk-")):
+        raise ValueError("xAI/Grok keys normally start with xai- or sk-")
+
+    path = _api_key_accounts_path(provider)
+    if path.exists():
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            data = {"accounts": data if isinstance(data, list) else []}
+    else:
+        data = {"accounts": []}
+    accounts = data.setdefault("accounts", [])
+    if not isinstance(accounts, list):
+        accounts = []
+        data["accounts"] = accounts
+
+    before_count = len(accounts)
+    accounts[:] = [acct for acct in accounts if not (isinstance(acct, dict) and str(acct.get("alias") or "") == alias)]
+    accounts.append({"alias": alias, "label": label, "api_key": api_key})
+    safe_write_json(path, data)
+    return {
+        "ok": True,
+        "provider": provider,
+        "alias": alias,
+        "label": label,
+        "config_path": str(path),
+        "replaced": len(accounts) < before_count + 1,
+        "key_fingerprint": _safe_key_fingerprint(api_key),
+        "note": "Saved locally with chmod 600. Raw API key is not returned; refresh the provider panel to validate it.",
+    }
+
+
+def grok_get(api_key: str, path: str, params: dict | None = None) -> dict:
+    query = urlencode(params or {}, doseq=True)
+    url = f"https://api.x.ai{path}" + (f"?{query}" if query else "")
+    req = Request(url, headers={
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "codex-account-usage-local/1.0",
+    })
+    try:
+        with urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return {"ok": True, "status": resp.status, "data": json.loads(raw) if raw else {}}
+    except Exception as exc:
+        status = getattr(exc, "code", None)
+        body = ""
+        try:
+            reader = getattr(exc, "read", None)
+            body = reader().decode("utf-8", "replace")[:1000] if reader else str(exc)[:1000]
+        except Exception:
+            body = str(exc)[:1000]
+        return {"ok": False, "status": status, "error": body or str(exc)}
+
+
+def get_grok_usage() -> dict:
+    accounts = load_grok_accounts()
+    rows = []
+    for acct in accounts:
+        api_key = acct["api_key"]
+        configured = bool(api_key and "..." not in api_key)
+        row = {
+            "alias": acct["alias"],
+            "label": acct["label"],
+            "key_fingerprint": _safe_key_fingerprint(api_key),
+            "configured": configured,
+        }
+        if not configured:
+            row.update({"ok": False, "key_valid": False, "error": "Grok/xAI API key not configured in local grok-accounts.json"})
+            rows.append(row)
+            continue
+        models = grok_get(api_key, "/v1/models")
+        model_items = (models.get("data") or {}).get("data", []) if models.get("ok") else []
+        row.update({
+            "ok": bool(models.get("ok")),
+            "key_valid": bool(models.get("ok")),
+            "models_count": len(model_items),
+            "models": [str(m.get("id") or m.get("model") or "") for m in model_items[:20] if isinstance(m, dict)],
+            "usage_note": "xAI/Grok public API key validation is available via /v1/models. Usage, spend, or credit balance API was not found in the public docs during implementation; add it here if xAI exposes an account usage endpoint.",
+        })
+        if not models.get("ok"):
+            row["errors"] = [{"source": "models", "status": models.get("status"), "error": models.get("error")}]
+        rows.append(row)
+    return {
+        "ok": True,
+        "configured_count": len([r for r in rows if r.get("configured")]),
+        "account_count": len(rows),
+        "source": "xai_grok_api_models_probe",
+        "config_path": str(GROK_ACCOUNTS_PATH),
+        "checked_at": datetime.now(MELBOURNE_TZ).isoformat(),
+        "rows": rows,
+    }
 
 
 def get_local_token_usage(start_s: str | None, end_s: str | None) -> dict:
@@ -825,7 +1576,7 @@ INDEX_HTML = r"""
     .btn.primary { background:#14539a; border-color:#2e7ccc; }
     .muted { color:var(--muted); font-size:12px; }
     .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#05080c; border:1px solid var(--line); border-radius:10px; padding:9px; overflow:auto; }
-    input { width:100%; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:9px; padding:8px; margin-top:6px; font-size:13px; }
+    input, select { width:100%; background:#05080c; color:var(--text); border:1px solid #2d4158; border-radius:9px; padding:8px; margin-top:6px; font-size:13px; }
     .inline-label { display:block; margin-top:8px; }
     pre { white-space:pre-wrap; max-height:220px; overflow:auto; }
     .actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
@@ -868,16 +1619,40 @@ INDEX_HTML = r"""
     <div class="muted" id="scheduler">Loading…</div>
   </section>
   <section class="card" style="margin-bottom:18px">
-    <div class="alias">Add account</div>
-    <p class="muted">Create a new dashboard slot and immediately start device-code auth. Alias is internal; display name is what you see on cards.</p>
+    <div class="alias">Add auth</div>
+    <p class="muted">Choose the provider first. Codex keeps the existing device-code flow. Anthropic and Grok save a local API key config used by the usage/auth panels.</p>
     <div class="row" style="align-items:flex-end; flex-wrap:wrap">
+      <label style="flex:1; min-width:190px"><span class="muted">Provider</span><select id="newProvider" onchange="updateAddAuthRequirements()"><option value="codex">OpenAI Codex OAuth</option><option value="anthropic">Anthropic API key</option><option value="grok">Grok / xAI API key</option></select></label>
       <label style="flex:1; min-width:220px"><span class="muted">Display name</span><input id="newLabel" placeholder="e.g. Spare Pro account" maxlength="120" /></label>
       <label style="flex:1; min-width:180px"><span class="muted">Alias</span><input id="newAlias" placeholder="e.g. spare-pro" maxlength="64" /></label>
-      <button class="btn primary" onclick="addAccount()">Add account</button>
+      <label id="newApiKeyWrap" style="flex:2; min-width:260px; display:none"><span class="muted">API key</span><input id="newApiKey" type="password" autocomplete="off" placeholder="Paste provider API key; saved locally only" /></label>
+      <button class="btn primary" onclick="addAccount()">Add auth</button>
     </div>
+    <pre class="muted" id="addAuthRequirements" style="margin-top:10px"></pre>
     <div class="muted" id="addAccountStatus"></div>
   </section>
   <section class="grid" id="cards" aria-label="Account cards. Drag cards left or right to reorder."></section>
+  <section class="card" id="codexSparkCardsSection" style="margin-top:18px; display:none">
+    <div class="alias">Codex Spark eligible accounts</div>
+    <div class="muted" id="codexSparkSummary">Only accounts marked for Codex Spark usage access are shown here.</div>
+    <section class="grid" id="codexSparkCards" aria-label="Codex Spark account cards."></section>
+  </section>
+  <section class="card" style="margin-top:18px">
+    <div class="alias">Anthropic API usage + cost</div>
+    <p class="muted">Tracks configured Anthropic Admin/API keys from local config. Shows 24h/7d token usage and 7d cost when the key has Admin Usage & Cost API access. Credit/balance is reported only if Anthropic exposes it through the API.</p>
+    <div class="actions"><button onclick="loadAnthropicUsage(true)">Refresh Anthropic usage</button><button onclick="toggleAnthropicApi()">Show API</button><a class="btn" href="/api/anthropic-usage" target="_blank">Raw Anthropic JSON</a></div>
+    <pre id="anthropicApiDetails" class="muted" style="display:none; margin-top:10px"></pre>
+    <div id="anthropicUsageSummary" style="margin-top:10px"></div>
+    <div id="anthropicUsageRows"></div>
+  </section>
+  <section class="card" style="margin-top:18px">
+    <div class="alias">Grok / xAI API auth</div>
+    <p class="muted">Tracks configured Grok/xAI API keys from local config. Validates auth via xAI's models endpoint. Usage/spend/credit will stay noted as unavailable unless xAI exposes a public usage/billing endpoint for the key.</p>
+    <div class="actions"><button onclick="loadGrokUsage(true)">Refresh Grok auth</button><button onclick="toggleGrokApi()">Show API</button><a class="btn" href="/api/grok-usage" target="_blank">Raw Grok JSON</a></div>
+    <pre id="grokApiDetails" class="muted" style="display:none; margin-top:10px"></pre>
+    <div id="grokUsageSummary" style="margin-top:10px"></div>
+    <div id="grokUsageRows"></div>
+  </section>
   <section class="card" style="margin-top:18px">
     <div class="alias">Token usage explorer</div>
     <p class="muted">OpenAI's Codex usage endpoint shows allowance % and reset times, not official token totals. This section reads local Codex thread token counters when available, with date/time filters.</p>
@@ -919,24 +1694,32 @@ INDEX_HTML = r"""
   <div class="modal-card">
     <div class="row"><div class="alias" id="shareTitle">Share auth</div><button onclick="closeShareModal()">Close</button></div>
     <div class="danger-note">Sensitive OAuth auth payload. Only paste/share with your own trusted agent machine. Anyone with this payload can use that Codex auth until revoked/re-authenticated.</div>
+    <label class="inline-label"><span class="muted">Default model to set on target machine (optional)</span><select id="shareDefaultModel" onchange="regenerateShareAuth()"><option value="">Leave target default model unchanged</option><option value="gpt-5.5">gpt-5.5</option><option value="gpt-5.4">gpt-5.4</option><option value="gpt-5.3-codex-spark">gpt-5.3-codex-spark</option><option value="gpt-5.3-codex">gpt-5.3-codex</option><option value="custom">Custom…</option></select></label>
+    <label class="inline-label" id="shareCustomModelWrap" style="display:none"><span class="muted">Custom default model</span><input id="shareCustomModel" placeholder="e.g. gpt-5.5" oninput="debouncedRegenerateShareAuth()" /></label>
+    <p class="muted" id="shareModelNote">Generated installers can also set ~/.codex/config.toml and Hermes config.yaml model defaults.</p>
     <p class="muted">Fast local repoint on this same machine:</p>
     <textarea id="shareLocal" readonly></textarea>
-    <div class="actions"><button onclick="copyText('shareLocal')">Copy local command</button></div>
-    <p class="muted">PowerShell → WSL installer for Windows Terminal/PowerShell when Hermes/Codex runs inside WSL. This contains the auth payload; do not paste into chats/logs.</p>
+    <div class="actions"><button onclick="copyText('shareLocal')">Copy local command</button><button onclick="downloadText('shareLocal','local-command')">Download as text file</button><button id="syncLocalAuthButton" onclick="syncLocalAuth()">Apply to this machine: Codex + Hermes stores</button></div>
+    <pre id="shareSyncResult" class="muted" style="display:none"></pre>
+    <p class="muted">PowerShell → WSL installer for Windows Terminal/PowerShell when Hermes/Codex runs inside WSL. This contains the auth payload and syncs Codex + existing Hermes stores inside WSL; do not paste into chats/logs.</p>
     <textarea id="sharePayload" readonly></textarea>
-    <div class="actions"><button onclick="copyText('sharePayload')">Copy PowerShell → WSL installer</button></div>
-    <p class="muted">Bash installer for Linux/macOS/WSL bash terminals:</p>
+    <div class="actions"><button onclick="copyText('sharePayload')">Copy PowerShell → WSL installer</button><button onclick="downloadText('sharePayload','powershell-wsl-installer')">Download as text file</button><button onclick="downloadRunner('sharePayload','powershell-wsl-installer','ps1')">Download self-deleting runner</button></div>
+    <p class="muted">Bash installer for Linux/macOS/WSL bash terminals. Syncs `~/.codex/auth.json` plus existing `~/.hermes` auth stores and prints safe fingerprints only:</p>
     <textarea id="sharePayloadBash" readonly></textarea>
-    <div class="actions"><button onclick="copyText('sharePayloadBash')">Copy bash installer</button></div>
+    <div class="actions"><button onclick="copyText('sharePayloadBash')">Copy bash installer</button><button onclick="downloadText('sharePayloadBash','bash-installer')">Download as text file</button><button onclick="downloadRunner('sharePayloadBash','bash-installer','command')">Download self-deleting runner</button></div>
     <p class="muted">Native Windows Codex installer, only if Codex runs outside WSL:</p>
     <textarea id="sharePayloadWindows" readonly></textarea>
-    <div class="actions"><button onclick="copyText('sharePayloadWindows')">Copy native Windows installer</button></div>
+    <div class="actions"><button onclick="copyText('sharePayloadWindows')">Copy native Windows installer</button><button onclick="downloadText('sharePayloadWindows','native-windows-installer')">Download as text file</button><button onclick="downloadRunner('sharePayloadWindows','native-windows-installer','ps1')">Download self-deleting runner</button></div>
     <p class="muted" id="shareBundle"></p>
   </div>
 </div>
 <script>
 let expected = [];
 let latestMachineUsageRows = [];
+let latestAnthropicUsage = null;
+let latestGrokUsage = null;
+let currentShareAlias = '';
+let currentShareLabel = '';
 function escapeHtml(s){ return String(s||'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
 function pct(n){ return Math.max(0, Math.min(100, Number(n||0))); }
 function fmtDate(ts){
@@ -965,6 +1748,7 @@ function usageLevel(primary, secondary, connected=true){
 function levelLabel(level, connected=true, primary=null, secondary=null){
   if(!connected) return '⚠ Needs auth';
   if(Number(secondary?.used_percent||0) >= 99) return '⛔ Rate limit warning';
+  if(Number(primary?.used_percent||0) >= 60) return '⚡ 5h burn high';
   return level === 'bad' ? '🚨 Switch soon' : level === 'warn' ? '⚡ Watch usage' : '✓ Healthy';
 }
 function resetText(win){
@@ -983,6 +1767,15 @@ function bar(label, win){
   if(!win) return `<div class="muted">${label}: no data</div>`;
   const p=pct(win.used_percent), cls=p>=90?'bad':p>=70?'warn':'ok';
   return `<div class="meter"><div class="row"><span>${label}</span><span class="${cls}">${p.toFixed(1)}% used · ${(100-p).toFixed(1)}% left</span></div><div class="bar"><div class="fill ${cls}" style="width:${p}%"></div></div>${resetLine(label, win)}</div>`;
+}
+function freshWeeklyResetNote(secondary){
+  if(!secondary) return '';
+  const used = Number(secondary.used_percent || 0);
+  const resetSeconds = Number(secondary.resets_in_seconds || 0);
+  if(used <= 10 && resetSeconds >= 6*24*3600){
+    return `Weekly window looks freshly reset: ${used.toFixed(1)}% used · ${resetText(secondary)}.`;
+  }
+  return '';
 }
 async function api(path, opts){ const r=await fetch(path, opts); return await r.json(); }
 function renderScheduler(state){
@@ -1004,22 +1797,51 @@ async function saveAccountDetails(alias){
   const label = document.getElementById(`name-${alias}`).value;
   const plan_label = document.getElementById(`plan-${alias}`).value;
   const plan_details = document.getElementById(`plan-details-${alias}`).value;
-  const res = await api('/api/accounts/details', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias,label,plan_label,plan_details})});
+  const codex_spark_access = !!document.getElementById(`spark-access-${alias}`)?.checked;
+  const res = await api('/api/accounts/details', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias,label,plan_label,plan_details,codex_spark_access})});
   if(!res.ok) alert(res.error || 'Save account details failed');
   await refreshAll();
 }
 function slugifyAlias(label){
   return String(label||'').toLowerCase().replace(/[^a-z0-9._-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,64);
 }
+function addAuthRequirements(provider){
+  const home = '~';
+  if(provider === 'anthropic') return `Anthropic requirements:\n- Paste a full Anthropic API key here (normally starts sk-ant-).\n- The key is saved only to ${home}/.codex-switch/anthropic-accounts.json with chmod 600.\n- Normal key validation uses GET /v1/models.\n- Usage/cost requires Anthropic Admin Usage & Cost API access; valid normal keys may still show admin blocked.\n- This does not touch Codex OAuth or Hermes openai-codex auth.`;
+  if(provider === 'grok') return `Grok / xAI requirements:\n- Paste a full xAI API key here (normally starts xai- or sk-).\n- The key is saved only to ${home}/.codex-switch/grok-accounts.json with chmod 600.\n- Validation uses https://api.x.ai/v1/models.\n- xAI public usage/spend/credit endpoints are not wired because no public usage endpoint was available when implemented.\n- This does not touch Codex OAuth or Hermes openai-codex auth.`;
+  return `OpenAI Codex requirements:\n- Uses the existing Codex device-code login flow; no API key is pasted here.\n- Creates/updates a dashboard slot, then opens /auth/<alias>.\n- Auth is saved under ${home}/.codex-switch/profiles/<alias>/auth.json by codex-switch-secure.\n- Existing Share Auth behavior remains unchanged: it can sync Codex CLI plus Hermes openai-codex stores when explicitly clicked.`;
+}
+function updateAddAuthRequirements(){
+  const provider = document.getElementById('newProvider')?.value || 'codex';
+  const keyWrap = document.getElementById('newApiKeyWrap');
+  const req = document.getElementById('addAuthRequirements');
+  if(keyWrap) keyWrap.style.display = provider === 'codex' ? 'none' : 'block';
+  if(req) req.innerText = addAuthRequirements(provider);
+}
 async function addAccount(){
+  const providerEl = document.getElementById('newProvider');
   const labelEl = document.getElementById('newLabel');
   const aliasEl = document.getElementById('newAlias');
+  const keyEl = document.getElementById('newApiKey');
   const statusEl = document.getElementById('addAccountStatus');
+  const provider = providerEl?.value || 'codex';
   const label = labelEl.value.trim();
   let alias = aliasEl.value.trim() || slugifyAlias(label);
   if(!label){ alert('Enter a display name first.'); return; }
   if(!alias){ alert('Enter an alias.'); return; }
   if(!/^[A-Za-z0-9._-]{1,64}$/.test(alias)){ alert('Alias can only use letters, numbers, dot, underscore, and dash.'); return; }
+  if(provider !== 'codex'){
+    const api_key = keyEl.value.trim();
+    if(!api_key){ alert(`Paste the ${provider === 'anthropic' ? 'Anthropic' : 'Grok/xAI'} API key first.`); return; }
+    statusEl.innerText = `Saving ${provider} key for ${label}…`;
+    const res = await api('/api/provider-keys/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({provider,alias,label,api_key})});
+    if(!res.ok){ alert(res.error || 'Add provider key failed'); statusEl.innerText = ''; return; }
+    labelEl.value = ''; aliasEl.value = ''; keyEl.value = '';
+    statusEl.innerText = `Saved ${provider} auth for ${label}. Key fp: ${res.key_fingerprint}. Refreshing validation…`;
+    if(provider === 'anthropic') await loadAnthropicUsage(true);
+    if(provider === 'grok') await loadGrokUsage(true);
+    return;
+  }
   statusEl.innerText = `Adding ${label}…`;
   const res = await api('/api/accounts/name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias,label})});
   if(!res.ok){ alert(res.error || 'Add failed'); statusEl.innerText = ''; return; }
@@ -1040,16 +1862,99 @@ async function copyText(id){
   el.focus(); el.select();
   await navigator.clipboard.writeText(el.value);
 }
-async function shareAuth(alias, label){
-  const res = await api('/api/accounts/share-auth', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias})});
+function safeDownloadName(part){
+  return String(part || '').toLowerCase().replace(/[^a-z0-9._-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,80) || 'share-auth';
+}
+function downloadBlobText(text, filename, mime='text/plain;charset=utf-8'){
+  const blob = new Blob([text], {type:mime});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+function shareDownloadBaseName(label){
+  const alias = safeDownloadName(currentShareAlias || 'account');
+  const model = safeDownloadName(selectedShareDefaultModel() || 'model-unchanged');
+  return `codex-share-auth-${alias}-${safeDownloadName(label)}-${model}`;
+}
+function downloadText(id, label){
+  const el = document.getElementById(id);
+  if(!el){ alert('Nothing to download yet.'); return; }
+  const text = el.value || '';
+  if(!text.trim()){ alert('Generate the Share Auth command first.'); return; }
+  downloadBlobText(text, `${shareDownloadBaseName(label)}.txt`);
+}
+function buildSelfDeletingRunner(rawText, kind){
+  if(kind === 'ps1'){
+    return `$ErrorActionPreference = "Stop"\n$__codexShareAuthExit = 0\ntry {\n${rawText}\n  if ($LASTEXITCODE -ne $null) { $__codexShareAuthExit = $LASTEXITCODE }\n}\ncatch {\n  Write-Error $_\n  $__codexShareAuthExit = 1\n}\nfinally {\n  if ($PSCommandPath) {\n    try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}\n  }\n}\nexit $__codexShareAuthExit\n`;
+  }
+  return `#!/usr/bin/env bash\nset -euo pipefail\n__codex_share_auth_self="${'${BASH_SOURCE[0]:-$0}'}"\ncleanup_codex_share_auth(){ /bin/rm -f -- "$__codex_share_auth_self" 2>/dev/null || true; }\ntrap cleanup_codex_share_auth EXIT\n${rawText}\n`;
+}
+function downloadRunner(id, label, kind){
+  const el = document.getElementById(id);
+  if(!el){ alert('Nothing to download yet.'); return; }
+  const text = el.value || '';
+  if(!text.trim()){ alert('Generate the Share Auth command first.'); return; }
+  const ext = kind === 'ps1' ? 'ps1' : 'command';
+  const filename = `${shareDownloadBaseName(label)}-self-deleting.${ext}`;
+  downloadBlobText(buildSelfDeletingRunner(text, kind), filename, kind === 'ps1' ? 'text/plain;charset=utf-8' : 'application/x-sh;charset=utf-8');
+}
+function selectedShareDefaultModel(){
+  const sel = document.getElementById('shareDefaultModel');
+  const custom = document.getElementById('shareCustomModel');
+  if(!sel) return '';
+  return sel.value === 'custom' ? (custom?.value || '').trim() : sel.value;
+}
+let shareRegenTimer = null;
+function debouncedRegenerateShareAuth(){ clearTimeout(shareRegenTimer); shareRegenTimer = setTimeout(regenerateShareAuth, 350); }
+async function regenerateShareAuth(){
+  if(!currentShareAlias) return;
+  const customWrap = document.getElementById('shareCustomModelWrap');
+  const sel = document.getElementById('shareDefaultModel');
+  if(customWrap && sel) customWrap.style.display = sel.value === 'custom' ? 'block' : 'none';
+  const default_model = selectedShareDefaultModel();
+  const res = await api('/api/accounts/share-auth', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias: currentShareAlias, default_model})});
   if(!res.ok){ alert(res.error || 'Share auth failed'); return; }
-  document.getElementById('shareTitle').innerText = `Share auth: ${label || alias}`;
-  document.getElementById('shareLocal').value = `${res.same_machine_switch_command}\n# If the target local agent only reads ~/.codex/auth.json, use:\n${res.same_machine_install_command}`;
+  document.getElementById('shareLocal').value = `${res.same_machine_switch_command}
+# If the target local agent only reads ~/.codex/auth.json, use:
+${res.same_machine_install_command}`;
   document.getElementById('sharePayload').value = res.target_machine_powershell_wsl_install_command || res.target_machine_payload_install_command;
   document.getElementById('sharePayloadBash').value = res.target_machine_bash_install_command || '';
   document.getElementById('sharePayloadWindows').value = res.target_machine_powershell_windows_install_command || '';
-  document.getElementById('shareBundle').innerText = `Local bundle written: ${res.bundle_path}\n${res.target_machine_import_command_note}`;
+  document.getElementById('shareBundle').innerText = `Local bundle written: ${res.bundle_path}
+${res.target_machine_import_command_note}`;
+  document.getElementById('shareModelNote').innerText = res.default_model_note || (default_model ? `Generated installers will set default model to ${default_model}.` : 'Generated installers leave default model unchanged.');
+}
+async function shareAuth(alias, label){
+  currentShareAlias = alias;
+  currentShareLabel = label || alias;
+  document.getElementById('shareTitle').innerText = `Share auth: ${currentShareLabel}`;
+  const syncResult = document.getElementById('shareSyncResult');
+  syncResult.style.display = 'none';
+  syncResult.innerText = '';
   document.getElementById('shareModal').classList.add('open');
+  await regenerateShareAuth();
+}
+async function syncLocalAuth(){
+  if(!currentShareAlias){ alert('Open Share Auth for an account first.'); return; }
+  const default_model = selectedShareDefaultModel();
+  const modelText = default_model ? ` and set default model to ${default_model}` : '';
+  if(!confirm(`Apply ${currentShareAlias} to ~/.codex/auth.json and existing Hermes auth stores on this machine${modelText}? This does not restart live Hermes gateways.`)) return;
+  const btn = document.getElementById('syncLocalAuthButton');
+  const out = document.getElementById('shareSyncResult');
+  btn.disabled = true;
+  out.style.display = 'block';
+  out.innerText = 'Syncing local Codex + Hermes auth stores…';
+  const res = await api('/api/accounts/sync-auth', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias: currentShareAlias, default_model})});
+  btn.disabled = false;
+  if(!res.ok){ out.innerText = `Sync failed: ${res.error || 'unknown error'}`; return; }
+  const targets = (res.hermes_targets||[]).map(t => `- ${t.path} · access ${t.access_fingerprint} · refresh ${t.refresh_fingerprint} · pool entries ${t.pool_entries_updated}`).join('\n');
+  const modelLine = res.default_model?.requested ? `\nDefault model: ${res.default_model.model} · Codex config ${res.default_model.codex_config_updated} · Hermes configs ${(res.default_model.hermes_configs_updated||[]).length}` : '\nDefault model: unchanged';
+  out.innerText = `Synced without printing secrets.\nCodex: ${res.codex_target}\nPayload fp: ${res.fingerprints?.payload}\nAccess fp: ${res.fingerprints?.access_token}\nRefresh fp: ${res.fingerprints?.refresh_token}${modelLine}\nHermes stores:\n${targets || '- none found'}\n\n${res.restart_note}`;
 }
 async function saveCardOrder(){
   const aliases = [...document.querySelectorAll('#cards .card[data-alias]')].map(el=>el.dataset.alias).filter(Boolean);
@@ -1111,6 +2016,107 @@ async function loadTokenUsage(){
   if(!rows.length){ document.getElementById('tokenRows').innerHTML = '<div class="muted">No local Codex token rows found for this filter.</div>'; return; }
   document.getElementById('tokenRows').innerHTML = `<table class="token-table"><thead><tr><th>Time</th><th>Tokens</th><th>Model</th><th>Thread</th></tr></thead><tbody>${rows.slice(0,50).map(r=>r.error ? `<tr><td>${escapeHtml(r.source_db)}</td><td colspan="3" class="bad">${escapeHtml(r.error)}</td></tr>` : `<tr><td>${escapeHtml(r.updated_at_iso||'')}</td><td>${Number(r.tokens_used||0).toLocaleString()}</td><td>${escapeHtml(r.model||'')}</td><td>${escapeHtml(r.title||r.thread_id||'')}</td></tr>`).join('')}</tbody></table>`;
 }
+function renderAnthropicApiDetails(){
+  const el = document.getElementById('anthropicApiDetails');
+  if(!el) return;
+  if(!latestAnthropicUsage){
+    el.innerText = 'Anthropic API status has not loaded yet.';
+    return;
+  }
+  const rows = latestAnthropicUsage.rows || [];
+  const details = {
+    endpoint: '/api/anthropic-usage',
+    config_path: latestAnthropicUsage.config_path,
+    source: latestAnthropicUsage.source,
+    upstream_api_checks: [
+      'GET https://api.anthropic.com/v1/models',
+      'GET https://api.anthropic.com/v1/organizations/usage_report/messages',
+      'GET https://api.anthropic.com/v1/organizations/cost_report'
+    ],
+    window: { start_1d: latestAnthropicUsage.start_1d, start_7d: latestAnthropicUsage.start_7d, ending_at: latestAnthropicUsage.ending_at },
+    accounts: rows.map(r => ({
+      alias: r.alias,
+      label: r.label,
+      key_fingerprint: r.key_fingerprint,
+      key_valid: r.key_valid,
+      admin_usage_readable: r.ok,
+      models_count: r.models_count,
+      usage_1d_ok: r.usage_1d_ok,
+      usage_7d_ok: r.usage_7d_ok,
+      cost_7d_ok: r.cost_7d_ok,
+      note: r.credit_note
+    }))
+  };
+  el.innerText = JSON.stringify(details, null, 2);
+}
+function toggleAnthropicApi(){
+  const el = document.getElementById('anthropicApiDetails');
+  if(!el) return;
+  const willShow = el.style.display === 'none' || !el.style.display;
+  if(willShow) renderAnthropicApiDetails();
+  el.style.display = willShow ? 'block' : 'none';
+}
+async function loadAnthropicUsage(force=false){
+  const summary = document.getElementById('anthropicUsageSummary');
+  const table = document.getElementById('anthropicUsageRows');
+  summary.innerHTML = '<div class="muted">Loading Anthropic usage…</div>';
+  const data = await api('/api/anthropic-usage');
+  latestAnthropicUsage = data;
+  const apiDetails = document.getElementById('anthropicApiDetails');
+  if(apiDetails && apiDetails.style.display !== 'none' && apiDetails.style.display) renderAnthropicApiDetails();
+  if(!data.ok){ summary.innerHTML = `<div class="bad">${escapeHtml(data.error||'Anthropic usage load failed')}</div>`; table.innerHTML=''; return; }
+  const rows = data.rows || [];
+  if(!rows.length){ summary.innerHTML = `<div class="muted">No Anthropic accounts configured. Add local accounts to ${escapeHtml(data.config_path||'~/.codex-switch/anthropic-accounts.json')}.</div>`; table.innerHTML=''; return; }
+  const okRows = rows.filter(r=>r.ok);
+  const total7d = rows.reduce((a,r)=>a+Number(r.total_tokens_7d||0),0);
+  const cost7d = rows.reduce((a,r)=>a+Number(r.cost_usd_7d||0),0);
+  summary.innerHTML = `<div><span class="summary-number">${total7d.toLocaleString()}</span> Anthropic tokens / 7d · $${cost7d.toFixed(4)} / 7d</div><div class="muted">${okRows.length}/${rows.length} accounts readable · ${escapeHtml(data.start_7d||'')} → ${escapeHtml(data.ending_at||'')} · config: ${escapeHtml(data.config_path||'')}</div>`;
+  table.innerHTML = `<table class="token-table"><thead><tr><th>Account</th><th>Status</th><th>24h tokens</th><th>7d tokens</th><th>7d cost</th><th>Credit/balance</th><th>Key fp</th><th>Notes</th></tr></thead><tbody>${rows.map(r=>{ const errs=(r.errors||[]).map(e=>`${e.source} ${e.status||''}: ${String(e.error||'').slice(0,180)}`).join(' | '); const statusText=r.ok?'admin readable':(r.key_valid?'valid key · admin blocked':'blocked'); const statusClass=r.ok?'ok':(r.key_valid?'warn':'bad'); return `<tr><td>${escapeHtml(r.label||r.alias)}</td><td class="${statusClass}">${statusText}</td><td>${Number(r.total_tokens_1d||0).toLocaleString()}</td><td>${Number(r.total_tokens_7d||0).toLocaleString()}</td><td>${r.cost_usd_7d==null?'unknown':('$'+Number(r.cost_usd_7d||0).toFixed(4))}</td><td>${escapeHtml(r.credit_note||'unknown')}</td><td>${escapeHtml(r.key_fingerprint||'')}</td><td class="muted">${escapeHtml(r.error||errs||'')}</td></tr>`; }).join('')}</tbody></table>`;
+}
+function renderGrokApiDetails(){
+  const el = document.getElementById('grokApiDetails');
+  if(!el) return;
+  if(!latestGrokUsage){ el.innerText = 'Grok/xAI API status has not loaded yet.'; return; }
+  const rows = latestGrokUsage.rows || [];
+  const details = {
+    endpoint: '/api/grok-usage',
+    config_path: latestGrokUsage.config_path,
+    source: latestGrokUsage.source,
+    upstream_api_checks: ['GET https://api.x.ai/v1/models'],
+    checked_at: latestGrokUsage.checked_at,
+    accounts: rows.map(r => ({
+      alias: r.alias,
+      label: r.label,
+      key_fingerprint: r.key_fingerprint,
+      key_valid: r.key_valid,
+      models_count: r.models_count,
+      usage_note: r.usage_note || r.error
+    }))
+  };
+  el.innerText = JSON.stringify(details, null, 2);
+}
+function toggleGrokApi(){
+  const el = document.getElementById('grokApiDetails');
+  if(!el) return;
+  const willShow = el.style.display === 'none' || !el.style.display;
+  if(willShow) renderGrokApiDetails();
+  el.style.display = willShow ? 'block' : 'none';
+}
+async function loadGrokUsage(force=false){
+  const summary = document.getElementById('grokUsageSummary');
+  const table = document.getElementById('grokUsageRows');
+  summary.innerHTML = '<div class="muted">Loading Grok/xAI auth status…</div>';
+  const data = await api('/api/grok-usage');
+  latestGrokUsage = data;
+  const apiDetails = document.getElementById('grokApiDetails');
+  if(apiDetails && apiDetails.style.display !== 'none' && apiDetails.style.display) renderGrokApiDetails();
+  if(!data.ok){ summary.innerHTML = `<div class="bad">${escapeHtml(data.error||'Grok usage load failed')}</div>`; table.innerHTML=''; return; }
+  const rows = data.rows || [];
+  if(!rows.length){ summary.innerHTML = `<div class="muted">No Grok/xAI accounts configured. Add local accounts to ${escapeHtml(data.config_path||'~/.codex-switch/grok-accounts.json')}.</div>`; table.innerHTML=''; return; }
+  const validRows = rows.filter(r=>r.key_valid);
+  summary.innerHTML = `<div><span class="summary-number">${validRows.length}</span> valid Grok/xAI key${validRows.length===1?'':'s'}</div><div class="muted">${validRows.length}/${rows.length} accounts valid · checked: ${escapeHtml(data.checked_at||'')} · config: ${escapeHtml(data.config_path||'')}</div>`;
+  table.innerHTML = `<table class="token-table"><thead><tr><th>Account</th><th>Status</th><th>Models</th><th>Key fp</th><th>Usage / credit</th><th>Notes</th></tr></thead><tbody>${rows.map(r=>{ const errs=(r.errors||[]).map(e=>`${e.source} ${e.status||''}: ${String(e.error||'').slice(0,180)}`).join(' | '); return `<tr><td>${escapeHtml(r.label||r.alias)}</td><td class="${r.key_valid?'ok':'bad'}">${r.key_valid?'valid':'blocked'}</td><td>${Number(r.models_count||0).toLocaleString()}</td><td>${escapeHtml(r.key_fingerprint||'')}</td><td>${escapeHtml(r.usage_note||'usage/credit unavailable')}</td><td class="muted">${escapeHtml(r.error||errs||'')}</td></tr>`; }).join('')}</tbody></table>`;
+}
 async function saveMachineSheetUrl(){
   const url = document.getElementById('machineSheetUrl').value.trim();
   const res = await api('/api/machine-usage/source', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})});
@@ -1149,6 +2155,150 @@ function renderMachineUsageTable(){
   if(!rows.length){ table.innerHTML = '<div class="muted">No machine rows match the current filter.</div>'; return; }
   table.innerHTML = `<table class="token-table"><thead><tr><th>Status</th><th>Agent</th><th>Machine / details</th><th>Account</th><th>30m</th><th>1h</th><th>2h</th><th>3h</th><th>24h</th><th>7d</th><th>Last used</th><th>Heartbeat age</th><th>Rate limits</th></tr></thead><tbody>${rows.map(r=>{ const id=machineDomId(r); return `<tr><td class="${escapeHtml(r.status||'')}">●</td><td>${escapeHtml(r.agent)}</td><td><div class="muted">raw: ${escapeHtml(r.machine)} · ${escapeHtml(r.os||'')}</div><input id="machine-name-${id}" value="${escapeHtml(r.display_machine||r.machine||'')}" maxlength="160" /><textarea class="compact" id="machine-details-${id}" placeholder="Machine details / owner / location / notes" maxlength="500">${escapeHtml(r.machine_details||'')}</textarea><div class="actions"><button onclick='saveMachineDetails(${JSON.stringify(r.agent||'')}, ${JSON.stringify(r.machine||'')})'>Save machine</button></div></td><td>${escapeHtml(r.current_account_alias||'')}</td><td>${Number(r.tokens_30m||0).toLocaleString()}</td><td>${Number(r.tokens_1h||0).toLocaleString()}</td><td>${Number(r.tokens_2h||0).toLocaleString()}</td><td>${Number(r.tokens_3h||0).toLocaleString()}</td><td>${Number(r.tokens_24h||0).toLocaleString()}</td><td>${Number(r.tokens_7d||0).toLocaleString()}</td><td>${escapeHtml(r.last_used_at||'')}</td><td>${r.age_minutes==null?'unknown':`${r.age_minutes}m`}</td><td>${Number(r.rate_limit_errors_24h||0).toLocaleString()}</td></tr>`; }).join('')}</tbody></table>`;
 }
+
+function getSparkUsage(profile){
+  const usage = profile?.usage || {};
+  return usage?.spark_usage || usage?.codex_spark || null;
+}
+
+function resolveUsageSource(profile, preferSpark=false){
+  const usage = profile?.usage || {};
+  if(!preferSpark) return usage;
+  const spark = getSparkUsage(profile);
+  if (spark && (spark.primary || spark.secondary)) {
+    return spark;
+  }
+  // Spark cards must not silently fall back to the normal Codex/GPT usage windows.
+  // If the API did not return an additional Spark allowance, show that explicitly
+  // instead of making a pro/Spark slot look like a free weekly-only card.
+  return {primary:null, secondary:null, spark_missing:true};
+}
+
+function isCodexSparkAccount(expected, profile){
+  const explicit = expected?.codex_spark_access;
+  if (typeof explicit === 'boolean') return explicit;
+  if (String(explicit || '').trim()) return /^(1|true|yes|on|y|t)$/i.test(String(explicit));
+
+  const fields = [
+    expected?.plan_label,
+    expected?.expected_plan,
+    profile?.account?.plan,
+    expected?.plan_details,
+  ];
+  const haystack = fields.map(v => String(v || '').toLowerCase()).join(' ');
+  return /\bcodex\s*spark\b/.test(haystack) || /\bspark\b/.test(haystack);
+}
+
+function usageCardData(expected, profile, showSparkUsage=false){
+  const usage = resolveUsageSource(profile, showSparkUsage);
+  const account = profile?.account || {};
+  const connected = !!profile;
+  const level = usageLevel(usage.primary, usage.secondary, connected);
+  const status = connected ? 'Connected' : 'Not connected';
+  const primaryPct = pct(usage.primary?.used_percent || 0);
+  const secondaryPct = pct(usage.secondary?.used_percent || 0);
+  const maxPct = Math.max(primaryPct, secondaryPct);
+  const leftPct = Math.max(0, 100 - maxPct);
+  const current = (profile?.is_current) ? '<span class="pill ok">active now</span>' : '';
+  const rateLimitBlocked = Number(usage.secondary?.used_percent || 0) >= 99;
+  const planLabel = expected?.plan_label || expected?.expected_plan || account?.plan || '';
+  const expectedPlan = String(expected?.plan_label || expected?.expected_plan || '').trim().toLowerCase();
+  const apiPlan = String(account?.plan || '').trim().toLowerCase();
+  const entitlementMismatch = !!(expectedPlan && apiPlan && expectedPlan !== apiPlan);
+  const sparkMissing = !!usage?.spark_missing;
+  const warning = sparkMissing
+    ? 'Codex Spark access is marked locally, but the live usage API did not return a Spark allowance for this auth. Re-authorize or check the OpenAI entitlement; the normal usage card may still show standard/free limits.'
+    : (entitlementMismatch
+        ? `Entitlement mismatch: dashboard expects ${expectedPlan}, but live OpenAI auth/API reports ${apiPlan}. Treat this auth as ${apiPlan} until re-authorized or fixed upstream.`
+        : (rateLimitBlocked
+            ? '7-day usage is 100% used. This is a rate limit warning: 5h usage may be unavailable or irrelevant until the weekly window resets.'
+            : (level === 'bad'
+                ? 'High burn: switch or let this account cool down before the next heavy run.'
+                : (level === 'warn'
+                    ? 'Approaching warning zone: keep an eye on reset timers before launching big jobs.'
+                    : 'Usage is below warning threshold.'))));
+  const isFreePlan = String(planLabel || '').trim().toLowerCase() === 'free' || (!expectedPlan && apiPlan === 'free');
+
+  return {
+    expected,
+    profile,
+    usage,
+    account,
+    level,
+    status,
+    primaryPct,
+    secondaryPct,
+    maxPct,
+    leftPct,
+    current,
+    warning,
+    planLabel,
+    isFreePlan,
+    connected,
+    sparkLabel: usage?.limit_name || usage?.metered_feature || '',
+    weeklyResetNote: freshWeeklyResetNote(usage.secondary),
+    entitlementMismatch,
+    expectedPlan,
+    apiPlan,
+    sparkMissing,
+    };
+}
+
+    function renderUsageBars(primary, secondary, isFreePlan){
+    if(!primary && isFreePlan && secondary){
+    return `<div class="muted">Free plan: no 5h window; showing 7d usage only.</div>${bar('7d / weekly', secondary)}`;
+    }
+    return `${bar('5h', primary)}${bar('7d / weekly', secondary)}`;
+    }
+
+    function renderWindowMetrics(maxPct, leftPct, primary, secondary, isFreePlan){
+      const fiveHourUsed = primary ? pct(primary.used_percent).toFixed(0) : '—';
+      const weeklyUsed = secondary ? pct(secondary.used_percent).toFixed(0) : '—';
+      const weeklyLeft = secondary ? (100 - pct(secondary.used_percent)).toFixed(0) : '—';
+      if(!primary && isFreePlan && secondary){
+        return `<div class="mini-metric"><b>${weeklyUsed}%</b><span>weekly used</span></div>` +
+          `<div class="mini-metric"><b>${weeklyLeft}%</b><span>weekly left</span></div>` +
+          `<div class="mini-metric"><b>${resetText(secondary)}</b><span>weekly reset</span></div>`;
+      }
+      return `<div class="mini-metric"><b>${fiveHourUsed}${fiveHourUsed==='—'?'':'%'}</b><span>5h used</span></div>` +
+        `<div class="mini-metric"><b>${weeklyUsed}${weeklyUsed==='—'?'':'%'}</b><span>weekly used</span></div>` +
+        `<div class="mini-metric"><b>${resetText(secondary)}</b><span>weekly reset</span></div>`;
+    }
+
+    function escapeJsString(value){
+      return String(value || '').replace(/\\/g, '\\').replace(/"/g, '\\"').replace(/\n/g, '\\\\n').replace(/\r/g, '');
+
+}
+
+function renderAccountCard(expected, profile){
+  const d = usageCardData(expected, profile);
+  const alias = escapeHtml(d.expected?.alias || '');
+  return `<article class="card usage-card is-${d.level}" data-alias="${alias}" title="Drag left/right to reorder"><div class="usage-card-inner"><div class="drag-handle">↔ drag to reorder</div><div class="row"><div><div class="alias">${escapeHtml(d.expected?.label || '')}</div><div class="muted">alias: ${alias}</div></div><span class="pill status-badge ${d.level}">${levelLabel(d.level, d.connected, d.usage.primary, d.usage.secondary)}</span></div>
+      <div class="usage-visual"><div class="usage-ring ${d.level}" style="--p:${d.maxPct}"><div class="ring-text">${d.maxPct.toFixed(0)}%<span>max used</span></div></div><div class="usage-meta"><div class="row"><span class="muted">${escapeHtml(d.status)}</span>${d.current}${d.entitlementMismatch ? '<span class="pill bad">auth says '+escapeHtml(d.apiPlan || 'unknown')+'</span>' : ''}</div>${sparkline(d.usage.primary, d.usage.secondary, d.level)}<div class="muted">Plan: ${escapeHtml(d.planLabel || 'unknown')}${d.apiPlan ? ` · live: ${escapeHtml(d.apiPlan)}` : ''}</div>${d.expected?.plan_details ? `<div class="muted">${escapeHtml(d.expected.plan_details)}</div>` : ''}</div></div>
+      <div class="metric-strip">${renderWindowMetrics(d.maxPct, d.leftPct, d.usage.primary, d.usage.secondary, d.isFreePlan)}</div>
+      ${d.weeklyResetNote ? `<div class="muted">${escapeHtml(d.weeklyResetNote)}</div>` : ''}
+      <div class="warn-callout"><b>${d.level==='bad' ? '🚨' : '⚠'}</b><div>${escapeHtml(d.warning)}</div></div>
+      <label class="muted inline-label">Display name</label><input id="name-${alias}" value="${escapeHtml(d.expected?.label || '')}" maxlength="120" />
+      <label class="muted inline-label">Plan name</label><input id="plan-${alias}" value="${escapeHtml(d.planLabel)}" placeholder="e.g. Team / Pro / Codex Spark" maxlength="120" />
+      <label class="muted inline-label">Plan details</label><textarea class="compact" id="plan-details-${alias}" placeholder="Plan notes, limits, owner, reset notes…" maxlength="500">${escapeHtml(d.expected?.plan_details || '')}</textarea>
+      <label class="muted inline-label"><input id="spark-access-${alias}" type="checkbox" ${d.expected?.codex_spark_access ? 'checked' : ''}/> Grant this account Codex Spark usage access</label>
+      <div class="actions"><button onclick="saveAccountDetails('${escapeJsString(d.expected?.alias || '')}')">Save account details</button></div>
+      ${renderUsageBars(d.usage.primary, d.usage.secondary, d.isFreePlan)}
+      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(d.expected?.alias || '')}">Auth</a><button onclick='shareAuth(${JSON.stringify(d.expected?.alias || '')}, ${JSON.stringify(d.expected?.label || d.expected?.alias || '')})'>Share Auth</button><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(d.expected?.alias || '')}, ${JSON.stringify(d.expected?.label || d.expected?.alias || '')})'>Remove</button></div></div></article>`;
+}
+
+function renderCodexSparkUsageCard(expected, profile){
+  const d = usageCardData(expected, profile, true);
+  return `<article class="card usage-card is-${d.level}" data-alias="${escapeHtml(d.expected?.alias || '')}"><div class="usage-card-inner"><div class="row"><div><div class="alias">${escapeHtml(d.expected?.label || '')}</div><div class="muted">alias: ${escapeHtml(d.expected?.alias || '')}</div></div><span class="pill status-badge ${d.level}">${levelLabel(d.level, d.connected, d.usage.primary, d.usage.secondary)}</span></div>
+      <div class="usage-visual"><div class="usage-ring ${d.level}" style="--p:${d.maxPct}"><div class="ring-text">${d.maxPct.toFixed(0)}%<span>max used</span></div></div><div class="usage-meta"><div class="row"><span class="muted">${escapeHtml(d.status)}</span>${d.current}${d.sparkMissing ? '<span class="pill bad">no Spark allowance from API</span>' : ''}</div>${d.sparkLabel ? `<div class="muted">Allowance: ${escapeHtml(d.sparkLabel)}</div>` : ''}<div class="muted">Plan: ${escapeHtml(d.planLabel || 'unknown')}${d.apiPlan ? ` · live: ${escapeHtml(d.apiPlan)}` : ''}</div>${d.expected?.plan_details ? `<div class="muted">${escapeHtml(d.expected.plan_details)}</div>` : ''}</div></div>
+      <div class="metric-strip">${renderWindowMetrics(d.maxPct, d.leftPct, d.usage.primary, d.usage.secondary, d.isFreePlan)}</div>
+      ${d.weeklyResetNote ? `<div class="muted">${escapeHtml(d.weeklyResetNote)}</div>` : ''}
+      ${d.sparkMissing ? `<div class="warn-callout"><b>⚠</b><div>${escapeHtml(d.warning)}</div></div>` : ''}
+      ${renderUsageBars(d.usage.primary, d.usage.secondary, d.isFreePlan)}
+    </div></article>`;
+}
+
+
 async function refreshAll(){
   const data = await api('/api/accounts');
   expected = data.accounts_config || expected || [];
@@ -1156,25 +2306,21 @@ async function refreshAll(){
   const profiles = data.profiles || [];
   const byAlias = Object.fromEntries(profiles.map(p=>[p.alias,p]));
   const merged = [...expected.map(e=>({expected:e, profile:byAlias[e.alias]})), ...profiles.filter(p=>!expected.find(e=>e.alias===p.alias)).map(p=>({expected:{alias:p.alias,label:p.alias,expected_plan:''}, profile:p}))];
-  document.getElementById('cards').innerHTML = merged.map(({expected:e, profile:p})=>{
-    const usage=p?.usage||{}; const acct=p?.account||{}; const connected=!!p; const level=usageLevel(usage.primary, usage.secondary, connected); const status=p?'Connected':'Not connected';
-    const primaryPct = pct(usage.primary?.used_percent||0), secondaryPct = pct(usage.secondary?.used_percent||0), maxPct = Math.max(primaryPct, secondaryPct);
-    const leftPct = Math.max(0, 100-maxPct);
-    const current = p?.is_current ? '<span class="pill ok">active now</span>' : '';
-    const rateLimitBlocked = Number(usage.secondary?.used_percent||0) >= 99;
-    const warningCopy = rateLimitBlocked ? '7-day usage is 100% used. This is a rate limit warning: 5h usage may be unavailable or irrelevant until the weekly window resets.' : level==='bad' ? 'High burn: switch or let this account cool down before the next heavy run.' : level==='warn' ? 'Approaching warning zone: keep an eye on reset timers before launching big jobs.' : 'Usage is below warning threshold.';
-    const planLabel = e.plan_label || e.expected_plan || acct.plan || '';
-    return `<article class="card usage-card is-${level}" data-alias="${escapeHtml(e.alias)}" title="Drag left/right to reorder"><div class="usage-card-inner"><div class="drag-handle">↔ drag to reorder</div><div class="row"><div><div class="alias">${escapeHtml(e.label)}</div><div class="muted">alias: ${escapeHtml(e.alias)}</div></div><span class="pill status-badge ${level}">${levelLabel(level, connected, usage.primary, usage.secondary)}</span></div>
-      <div class="usage-visual"><div class="usage-ring ${level}" style="--p:${maxPct}"><div class="ring-text">${maxPct.toFixed(0)}%<span>max used</span></div></div><div class="usage-meta"><div class="row"><span class="muted">${escapeHtml(status)}</span>${current}</div>${sparkline(usage.primary, usage.secondary, level)}<div class="muted">Plan: ${escapeHtml(planLabel||'unknown')}</div>${e.plan_details?`<div class="muted">${escapeHtml(e.plan_details)}</div>`:''}</div></div>
-      <div class="metric-strip"><div class="mini-metric"><b>${leftPct.toFixed(0)}%</b><span>lowest left</span></div><div class="mini-metric"><b>${resetText(usage.primary)}</b><span>5h window</span></div><div class="mini-metric"><b>${resetText(usage.secondary)}</b><span>weekly</span></div></div>
-      <div class="warn-callout"><b>${level==='bad'?'🚨':'⚠'}</b><div>${escapeHtml(warningCopy)}</div></div>
-      <label class="muted inline-label">Display name</label><input id="name-${escapeHtml(e.alias)}" value="${escapeHtml(e.label)}" maxlength="120" />
-      <label class="muted inline-label">Plan name</label><input id="plan-${escapeHtml(e.alias)}" value="${escapeHtml(planLabel)}" placeholder="e.g. Team / Pro / Adam's account" maxlength="120" />
-      <label class="muted inline-label">Plan details</label><textarea class="compact" id="plan-details-${escapeHtml(e.alias)}" placeholder="Plan notes, limits, owner, reset notes…" maxlength="500">${escapeHtml(e.plan_details||'')}</textarea>
-      <div class="actions"><button onclick="saveAccountDetails('${escapeHtml(e.alias)}')">Save account details</button></div>
-      ${bar('5h', usage.primary)}${bar('7d / weekly', usage.secondary)}
-      <div class="actions"><a class="btn primary" href="/auth/${encodeURIComponent(e.alias)}">Auth</a><button onclick='shareAuth(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Share Auth</button><button onclick="refreshAll()">Refresh</button><button onclick='removeAccount(${JSON.stringify(e.alias)}, ${JSON.stringify(e.label)})'>Remove</button></div></div></article>`;
-  }).join('');
+    const codexSparkRows = merged.filter(({expected, profile}) => isCodexSparkAccount(expected, profile));
+  document.getElementById('cards').innerHTML = merged.map(({expected, profile}) => renderAccountCard(expected, profile)).join('');
+  const sparkSection = document.getElementById('codexSparkCardsSection');
+  const sparkSectionSummary = document.getElementById('codexSparkSummary');
+  const sparkCards = document.getElementById('codexSparkCards');
+  const sparkCount = codexSparkRows.length;
+  if(sparkSection && sparkSectionSummary && sparkCards){
+    sparkSection.style.display = sparkCount ? 'block' : 'none';
+    sparkSectionSummary.innerText = sparkCount
+      ? `${sparkCount} account${sparkCount===1?'':'s'} with Codex Spark access`
+      : 'No accounts currently marked for Codex Spark access.';
+    sparkCards.innerHTML = sparkCount
+      ? codexSparkRows.map(({expected, profile}) => renderCodexSparkUsageCard(expected, profile)).join('')
+      : '';
+  }
   setupDragReorder();
   renderAuthLinks();
 }
@@ -1250,7 +2396,7 @@ Success criteria to report back:
 - Any limitations, e.g. token totals unavailable so 0 is reported
 `;
 }
-initTokenFilters(); refreshAll(); loadTokenUsage(); loadMachineUsage(); setInterval(refreshAll, 15000); setInterval(loadMachineUsage, 30000);
+updateAddAuthRequirements(); initTokenFilters(); refreshAll(); loadTokenUsage(); loadAnthropicUsage(); loadGrokUsage(); loadMachineUsage(); setInterval(refreshAll, 15000); setInterval(loadMachineUsage, 30000);
 </script>
 </body>
 </html>
@@ -1321,6 +2467,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(get_local_token_usage(qs.get("start", [None])[0], qs.get("end", [None])[0]))
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if path == "/api/anthropic-usage":
+            try:
+                return self.send_json(get_anthropic_usage())
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if path == "/api/grok-usage":
+            try:
+                return self.send_json(get_grok_usage())
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
         if path == "/api/machine-usage":
             qs = parse_qs(parsed.query)
             try:
@@ -1360,7 +2516,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/accounts/details":
             try:
                 body = self.read_json_body()
-                acct = set_account_details(str(body.get("alias") or ""), body.get("label"), body.get("plan_label"), body.get("plan_details"))
+                acct = set_account_details(str(body.get("alias") or ""), body.get("label"), body.get("plan_label"), body.get("plan_details"), body.get("codex_spark_access"))
                 return self.send_json({"ok": True, "account": acct, "accounts": get_expected_accounts()})
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
@@ -1374,7 +2530,26 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/accounts/share-auth":
             try:
                 body = self.read_json_body()
-                result = build_share_auth(str(body.get("alias") or ""))
+                result = build_share_auth(str(body.get("alias") or ""), body.get("default_model"))
+                return self.send_json(result)
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/accounts/sync-auth":
+            try:
+                body = self.read_json_body()
+                result = sync_auth_to_local_stores(str(body.get("alias") or ""), body.get("default_model"))
+                return self.send_json(result)
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/provider-keys/add":
+            try:
+                body = self.read_json_body()
+                result = add_api_key_account(
+                    str(body.get("provider") or ""),
+                    str(body.get("alias") or ""),
+                    str(body.get("label") or ""),
+                    str(body.get("api_key") or ""),
+                )
                 return self.send_json(result)
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)

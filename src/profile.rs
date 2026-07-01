@@ -115,9 +115,8 @@ pub fn lock_live_auth() -> Result<File> {
                     // inode, but new acquirers race on the freshly created inode instead.
                     drop(file);
                     let prev_holder = read_lock_holder(&path);
-                    std::fs::remove_file(&path).with_context(|| {
-                        format!("removing stale auth lock {}", path.display())
-                    })?;
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("removing stale auth lock {}", path.display()))?;
                     let new_file = open_lock_file(&path)?;
                     new_file.lock_exclusive().with_context(|| {
                         format!("locking recreated auth lock {}", path.display())
@@ -523,7 +522,9 @@ pub fn auto_track_current() -> bool {
             };
             if existing == val {
                 if let Err(e) = write_current(&alias) {
-                    tracing::debug!("auto_track_current: could not sync current pointer by auth value: {e}");
+                    tracing::debug!(
+                        "auto_track_current: could not sync current pointer by auth value: {e}"
+                    );
                 }
                 return false;
             }
